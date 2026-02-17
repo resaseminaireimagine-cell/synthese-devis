@@ -1,3 +1,19 @@
+# app.py
+# --------------------------------------------------------------------
+# Synthèse devis prestataires — Institut Imagine (V4)
+# Objectif:
+# - Upload PDFs (traiteur + technique)
+# - Extraction robuste (anti bruit: CGV/IBAN/tableaux/pages)
+# - Sélection assistée (checkbox) => fiabilité
+# - Contrôle qualité bloquant (vendor + total TTC requis, vendor non "titre")
+# - Word premium (charte: rose Imagine, police Montserrat si disponible)
+#
+# Notes importantes:
+# - Les PDFs "marketing" (avec photos) sont très bruités => on privilégie
+#   une extraction de candidats + validation par sélection.
+# - Montserrat dans Word dépend de l'installation sur le poste lecteur.
+# --------------------------------------------------------------------
+
 import io
 import re
 from dataclasses import dataclass
@@ -20,9 +36,8 @@ from docx.oxml.ns import qn
 APP_TITLE = "Synthèse devis prestataires — Institut Imagine"
 PRIMARY = "#AF0073"
 BG = "#F6F7FB"
-FONT = "Montserrat"  # appliqué dans le docx (substitution possible si police non installée)
+FONT = "Montserrat"
 
-# “modes” (catégories)
 CATERING_POSTS = [
     "Accueil café",
     "Pause matin",
@@ -46,37 +61,53 @@ TECH_POSTS = [
     "Conseil",
 ]
 
-# Mots utiles (génériques) pour garder du contenu "menu"
+# Generic “menu” signal (kept)
 MENU_HINTS = [
-    # boissons / bases
-    "café", "cafe", "thé", "the", "soft", "jus", "eau",
-    # formats repas
+    "café", "cafe", "thé", "the", "soft", "jus", "eau", "viennoiser",
     "accueil", "petit", "déjeuner", "dejeuner", "pause", "buffet", "cocktail", "apéritif", "aperitif",
-    # quantités / typologies
     "pièce", "pieces", "pièces", "/pers", "par personne", "convive", "invité",
-    "salée", "sucrée", "dessert", "viennoiser", "mignard", "gourmand",
-    # éléments fréquents (sans être “marque”)
+    "salée", "sucrée", "dessert", "mignard", "gourmand",
     "sandwich", "wrap", "salade", "fromage", "fruit", "tartelette", "cannel", "financier",
     "vin", "champagne",
 ]
 
-# Mots qui signalent du bruit administratif / légal (génériques)
-NOISE_HINTS = [
-    "conditions générales", "cgv", "rgpd", "données personnelles", "propriété intellectuelle", "droit à l'image",
-    "siret", "rcs", "tva", "iban", "bic", "rib", "banque", "capital",
-    "pénalité", "recouvrement", "mise en demeure", "tribunal", "responsabilité", "dommages", "intérêts",
-    "déchéance", "résolutoire", "litige", "contestation", "dédommagement",
-    "adresse", "tél", "tel", "email", "e-mail", "www.", "site internet",
-    "référence", "devis n", "date de devis", "date de validité", "signature", "mode de paiement", "facture",
-    "net a payer", "net à payer", "base ht", "total ht", "total ttc", "page ",
-    # annulation presta (souvent du bruit pour la synthèse)
-    "à moins de 24h", "a moins de 24h", "à moins de 48h", "a moins de 48h", "annulée", "annulee",
+# Generic “tech” signal (kept)
+TECH_HINTS = [
+    "captation", "diffusion", "live", "zoom", "replay", "wetransfer", "stream",
+    "réalisateur", "realisateur", "cadreur", "ingénieur", "ingenieur", "son",
+    "caméra", "camera", "régie", "regie", "installation", "direct",
+    "duplex", "plateforme", "tv", "écran", "ecran", "écrans", "ecrans",
+    "pavlov", "zapette", "retour", "we transfer",
 ]
 
-# mots interdits dans un nom de prestataire (générique, pas lié à un devis)
+# Generic noise (dropped)
+NOISE_HINTS = [
+    # legal/admin/payment
+    "conditions générales", "cgv", "rgpd", "données personnelles", "donnees personnelles",
+    "propriété intellectuelle", "propriete intellectuelle", "droit à l'image", "droit a l'image",
+    "siret", "rcs", "tva", "iban", "bic", "rib", "banque", "capital",
+    "pénalité", "penalite", "recouvrement", "mise en demeure", "tribunal",
+    "responsabilité", "responsabilite", "dommages", "intérêts", "interets",
+    "déchéance", "decheance", "résolutoire", "resolutoire", "litige", "contestation", "dédommagement", "dedommagement",
+    "adresse", "tél", "tel", "email", "e-mail", "www.", "site internet",
+    "référence", "reference", "devis n", "date de devis", "date de validité", "signature",
+    "mode de paiement", "facture", "net a payer", "net à payer", "net à payer",
+    "base ht", "total ht", "total ttc", "page ",
+    "société générale", "societe generale", "caisse d'epargne", "caisse d’épargne", "cic",
+    # cancellation boilerplate
+    "à moins de 24h", "a moins de 24h", "à moins de 48h", "a moins de 48h", "annulée", "annulee",
+    # extra “logistic pricing clause” noise
+    "heure supplémentaire", "heures supplémentaires", "heure supplementaire", "heures supplementaires",
+]
+
+# Vendor validation (generic forbidden tokens)
 VENDOR_FORBIDDEN = [
-    "accueil", "pause", "déjeuner", "dejeuner", "cocktail", "scénographie", "scenographie",
-    "boissons", "livraison", "personnel", "installation", "déroulé", "deroule",
+    # meal posts / internal titles
+    "accueil", "pause", "déjeuner", "dejeuner", "cocktail", "boissons", "options",
+    "scénographie", "scenographie", "livraison", "personnel", "installation", "déroulé", "deroule",
+    # report/recap titles
+    "récapitulatif", "recapitulatif", "sur la base", "version", "hors options", "budget",
+    "proposition", "détail", "detail",
 ]
 
 
@@ -109,10 +140,9 @@ def extract_pdf_text(uploaded_file) -> str:
 
 
 def split_lines(text: str) -> List[str]:
-    # tente de mieux segmenter certaines sorties PDF
+    # improve segmentation of some PDFs
     text = text.replace("•", "\n• ")
     text = text.replace(":-", ": -")
-    # espace après ponctuation collée
     text = re.sub(r"([:;])([A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 \2", text)
     raw = text.splitlines()
     out = []
@@ -122,43 +152,6 @@ def split_lines(text: str) -> List[str]:
         if rr:
             out.append(rr)
     return out
-
-
-def looks_like_price_table_line(s: str) -> bool:
-    # lignes très chiffrées (prix, quantités)
-    core = re.sub(r"[€]", "", norm(s))
-    if re.fullmatch(r"[\d\s,\.%]+", core) and sum(ch.isdigit() for ch in core) >= 6:
-        return True
-    return False
-
-
-def is_noise_line(s: str) -> bool:
-    s = norm(s)
-    if not s:
-        return True
-    l = fold(s)
-
-    # numéros de page isolés
-    if re.fullmatch(r"\d{1,3}", s):
-        return True
-
-    # tableaux / colonnes
-    if looks_like_price_table_line(s):
-        return True
-
-    # bruit légal/administratif
-    if any(k in l for k in NOISE_HINTS):
-        return True
-
-    # boilerplate "Institut Imagine + étage + sur la base"
-    if "institut imagine" in l and ("étage" in l or "etage" in l or "sur la base" in l):
-        return True
-
-    # horaires isolés
-    if (re.search(r"\b\d{1,2}h\d{0,2}\b", l) or re.search(r"\bde\s+\d{1,2}h\d{0,2}\b", l)) and len(l) <= 40:
-        return True
-
-    return False
 
 
 def parse_eur_amount(s: str) -> float | None:
@@ -202,6 +195,39 @@ def find_total_ttc(text: str) -> float | None:
     return None
 
 
+def looks_like_price_table_line(s: str) -> bool:
+    core = re.sub(r"[€]", "", norm(s))
+    if re.fullmatch(r"[\d\s,\.%]+", core) and sum(ch.isdigit() for ch in core) >= 6:
+        return True
+    return False
+
+
+def is_noise_line(s: str) -> bool:
+    s = norm(s)
+    if not s:
+        return True
+    l = fold(s)
+
+    if re.fullmatch(r"\d{1,3}", s):
+        return True
+
+    if looks_like_price_table_line(s):
+        return True
+
+    if any(k in l for k in NOISE_HINTS):
+        return True
+
+    # boilerplate for marketing PDFs
+    if "institut imagine" in l and ("étage" in l or "etage" in l or "sur la base" in l):
+        return True
+
+    # short time-only lines
+    if (re.search(r"\b\d{1,2}h\d{0,2}\b", l) or re.search(r"\bde\s+\d{1,2}h\d{0,2}\b", l)) and len(l) <= 40:
+        return True
+
+    return False
+
+
 def is_section_header(line: str) -> bool:
     l = fold(line)
     keys = [
@@ -224,7 +250,7 @@ def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
     current: List[str] = []
 
     for ln in lines:
-        # évite déclenchement sur entêtes tableau
+        # avoid section split on table headers
         if re.fullmatch(r"(RÉF|REF|QTÉ|QTE|PU|PU HT|MONTANT|TVA|TAUX|BASE HT)\b.*", ln, flags=re.I):
             current.append(ln)
             continue
@@ -244,11 +270,6 @@ def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
 
 
 def unglue(s: str) -> str:
-    """
-    Améliore la lisibilité sans dépendre de mots propres à un devis.
-    - ajoute des séparateurs après 'soit XXX pièces', etc.
-    - tente de réinsérer des séparations entre mots collés (faible risque).
-    """
     s = norm(s)
     s = re.sub(r"(\d)\s*(pi[eè]ces)([A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 \2 • \3", s, flags=re.I)
     s = re.sub(r"(personne|convive|invité)([A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 • \2", s, flags=re.I)
@@ -257,11 +278,11 @@ def unglue(s: str) -> str:
     return s
 
 
-def bullet_candidates(lines: List[str]) -> List[str]:
+def bullet_candidates(lines: List[str], mode: str) -> List[str]:
     """
-    Extraction générique de candidats:
-    - bullets
-    - lignes courtes contenant des hints menu
+    mode:
+      - 'catering' => keep MENU_HINTS
+      - 'tech'     => keep TECH_HINTS
     """
     items: List[str] = []
     for ln in lines:
@@ -276,8 +297,11 @@ def bullet_candidates(lines: List[str]) -> List[str]:
             continue
 
         l = fold(s)
-        if len(s) <= 180 and any(k in l for k in MENU_HINTS):
-            items.append(unglue(s))
+        if len(s) <= 200:
+            if mode == "catering" and any(k in l for k in MENU_HINTS):
+                items.append(unglue(s))
+            elif mode == "tech" and any(k in l for k in TECH_HINTS):
+                items.append(unglue(s))
 
     # de-dup
     out, seen = [], set()
@@ -301,44 +325,47 @@ def summarize_for_table(items: List[str], max_chars: int = 380) -> str:
 
 
 def vendor_is_suspicious(v: str) -> bool:
-    lv = fold(v)
-    if not v or len(norm(v)) < 3:
+    v = norm(v)
+    if len(v) < 3:
         return True
+    lv = fold(v)
     if "@" in v or "contact" in lv:
         return True
     if any(w in lv for w in VENDOR_FORBIDDEN):
+        return True
+    # address-like lines
+    if any(k in lv for k in ["rue", "avenue", "boulevard", "france", "paris"]):
+        # not always invalid, but suspicious as vendor name
         return True
     return False
 
 
 def guess_vendor_name(text: str, filename: str) -> str:
     """
-    Heuristique générique:
-    - cherche une ligne "marque" (beaucoup de lettres / majuscules)
-    - pénalise contact/tel/email/adresse
-    - pénalise mots de postes
+    Generic vendor guess (safe):
+    - find “brand-like” lines
+    - penalize contacts, addresses, forbidden words
     """
     lines = [norm(x) for x in text.splitlines() if norm(x)]
-
-    bad = re.compile(r"\b(devis|facture|date|total|tva|siret|iban|bic|net a payer|net à payer|contact)\b", re.I)
+    bad = re.compile(r"\b(devis|facture|date|total|tva|siret|iban|bic|net a payer|net à payer)\b", re.I)
 
     def penalty(ln: str) -> int:
         l = fold(ln)
         p = 0
         if "contact" in l:
-            p += 8
+            p += 10
         if "@" in ln:
-            p += 10
-        if re.search(r"\b0[1-9](\s?\d{2}){4}\b", ln):
-            p += 10
-        if any(w in l for w in VENDOR_FORBIDDEN):
             p += 12
-        if any(k in l for k in ["rue", "avenue", "boulevard", "paris", "france"]):
-            p += 4
+        if re.search(r"\b0[1-9](\s?\d{2}){4}\b", ln):
+            p += 12
+        if any(w in l for w in VENDOR_FORBIDDEN):
+            p += 14
+        if any(k in l for k in ["rue", "avenue", "boulevard", "france", "paris"]):
+            p += 6
         return p
 
     candidates = []
-    for ln in lines[:220]:
+    for ln in lines[:240]:
         if len(ln) < 4 or len(ln) > 70:
             continue
         if bad.search(ln):
@@ -348,7 +375,6 @@ def guess_vendor_name(text: str, filename: str) -> str:
         alpha = sum(ch.isalpha() for ch in ln)
         if alpha < 6:
             continue
-        # “marque” si uppercase ou ratio lettres élevé
         if (ln.upper() == ln) or (alpha / max(len(ln), 1) > 0.55):
             candidates.append(ln)
 
@@ -378,7 +404,6 @@ def classify_catering_section(title: str) -> str:
     if "déjeuner" in l or "dejeuner" in l or "buffet" in l or "déjeunatoire" in l:
         return "Déjeuner"
     if "cocktail" in l or "apéritif" in l or "aperitif" in l:
-        # cocktail déjeunatoire => déjeuner
         if "déjeunatoire" in l:
             return "Déjeuner"
         return "Cocktail"
@@ -403,13 +428,13 @@ def classify_tech_section(title: str) -> str:
         return "Conseil"
     if "inclus" in l:
         return "Inclus"
-    if any(k in l for k in ["équipe", "ingenieur", "ingénieur", "cadreur", "réalisateur", "realisateur"]):
+    if any(k in l for k in ["équipe", "ingenieur", "ingénieur", "cadreur", "réalisateur", "realisateur", "son"]):
         return "Équipe"
     if "captation" in l or "caméra" in l or "camera" in l:
         return "Captation"
     if "régie" in l or "regie" in l:
         return "Régie"
-    if "diffusion" in l or "live" in l or "zoom" in l:
+    if "diffusion" in l or "live" in l or "zoom" in l or "stream" in l:
         return "Diffusion"
     if "replay" in l or "wetransfer" in l:
         return "Replay"
@@ -435,6 +460,7 @@ class Offer:
 def parse_catering(text: str, filename: str) -> Offer:
     vendor = guess_vendor_name(text, filename)
     total_ttc = find_total_ttc(text)
+
     lines = split_lines(text)
     filtered = [ln for ln in lines if not is_noise_line(ln)]
     sections = extract_sections(filtered)
@@ -442,7 +468,7 @@ def parse_catering(text: str, filename: str) -> Offer:
     candidates = {k: [] for k in CATERING_POSTS}
     for title, body in sections:
         post = classify_catering_section(title)
-        items = bullet_candidates(body)
+        items = bullet_candidates(body, mode="catering")
         for it in items:
             if "en option" in fold(it) or fold(it).startswith("option"):
                 candidates["Options"].append(it)
@@ -467,6 +493,7 @@ def parse_catering(text: str, filename: str) -> Offer:
 def parse_tech(text: str, filename: str) -> Offer:
     vendor = guess_vendor_name(text, filename)
     total_ttc = find_total_ttc(text)
+
     lines = split_lines(text)
     filtered = [ln for ln in lines if not is_noise_line(ln)]
     sections = extract_sections(filtered)
@@ -474,17 +501,18 @@ def parse_tech(text: str, filename: str) -> Offer:
     candidates = {k: [] for k in TECH_POSTS}
     for title, body in sections:
         post = classify_tech_section(title)
-        items = bullet_candidates(body)
+        items = bullet_candidates(body, mode="tech")
 
-        # ajout de quelques phrases "tech" même sans hints menu (mais filtrées)
+        # Additionally, keep short lines with TECH_HINTS even if not bulletized
+        # (already handled by bullet_candidates), but we also want to keep some structured phrases
+        # that may not match hints perfectly (e.g., "2 caméras 4K").
         for ln in body:
             s = norm(ln)
             if not s or is_noise_line(s):
                 continue
             l = fold(s)
-            if any(k in l for k in ["captation", "diffusion", "zoom", "replay", "wetransfer", "caméra", "camera", "régie", "regie", "ingénieur", "cadreur", "réalisateur", "installation", "direct"]):
-                if len(s) <= 200:
-                    items.append(unglue(s))
+            if len(s) <= 200 and (("4k" in l) or ("cam" in l) or ("zoom" in l) or ("régi" in l) or ("regi" in l)):
+                items.append(unglue(s))
 
         # de-dup
         out, seen = [], set()
@@ -497,6 +525,7 @@ def parse_tech(text: str, filename: str) -> Offer:
 
         candidates[post].extend(out)
 
+    # final de-dup per post
     for k in candidates:
         out, seen = [], set()
         for it in candidates[k]:
@@ -512,7 +541,7 @@ def parse_tech(text: str, filename: str) -> Offer:
 
 
 # =========================
-# WORD STYLING
+# WORD GENERATION
 # =========================
 def set_cell_shading(cell, fill_hex: str):
     fill_hex = fill_hex.replace("#", "")
@@ -546,22 +575,22 @@ def set_run(run, bold=False, size=10, color="#111827"):
 
 def add_title(doc: Document, text: str):
     p = doc.add_paragraph()
-    run = p.add_run(text)
-    set_run(run, bold=True, size=16, color=PRIMARY)
+    r = p.add_run(text)
+    set_run(r, bold=True, size=16, color=PRIMARY)
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 def add_subtitle(doc: Document, text: str):
     p = doc.add_paragraph()
-    run = p.add_run(text)
-    set_run(run, bold=True, size=11, color="#111827")
+    r = p.add_run(text)
+    set_run(r, bold=True, size=11, color="#111827")
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 def add_small(doc: Document, text: str):
     p = doc.add_paragraph()
-    run = p.add_run(text)
-    set_run(run, bold=False, size=9, color="#374151")
+    r = p.add_run(text)
+    set_run(r, bold=False, size=9, color="#374151")
 
 
 def build_word(event_title: str, event_date: str, guests: int, catering: List[Offer], tech: List[Offer]) -> bytes:
@@ -577,7 +606,6 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
     add_small(doc, f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     doc.add_paragraph("")
 
-    # Traiteur — page 1 complete
     if catering:
         add_subtitle(doc, "1) PRESTATION TRAITEUR — Comparatif (synthèse)")
         vendors = catering[:3]
@@ -627,13 +655,12 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
 
         doc.add_paragraph("")
 
-    # Technique — page 1
     if tech:
         add_subtitle(doc, "2) PRESTATION TECHNIQUE — Synthèse")
         for idx, off in enumerate(tech[:2], start=1):
             p = doc.add_paragraph()
-            run = p.add_run(f"Prestataire technique {idx} : {off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
-            set_run(run, bold=True, size=9, color="#111827")
+            r = p.add_run(f"Prestataire technique {idx} : {off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
+            set_run(r, bold=True, size=9, color="#111827")
 
             t = doc.add_table(rows=1, cols=2)
             h = t.rows[0].cells
@@ -671,7 +698,6 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
                             set_run(rrr, bold=False, size=9, color="#111827")
             doc.add_paragraph("")
 
-    # DETAILS (validated)
     doc.add_page_break()
     add_title(doc, "DÉTAIL DES OFFRES (éléments validés)")
     add_small(doc, "Les listes ci-dessous correspondent aux éléments cochés (contrôle qualité).")
@@ -679,14 +705,14 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
     if catering:
         doc.add_paragraph("")
         add_subtitle(doc, "A) TRAITEUR — Détail par prestataire")
-        for i, off in enumerate(catering[:3], start=1):
+        for off in catering[:3]:
             doc.add_paragraph("")
             add_subtitle(doc, f"{off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
             for post in CATERING_POSTS:
                 items = off.selected.get(post, [])
                 p = doc.add_paragraph()
-                run = p.add_run(f"{post} :")
-                set_run(run, bold=True, size=10, color="#111827")
+                r = p.add_run(f"{post} :")
+                set_run(r, bold=True, size=10, color="#111827")
                 if not items:
                     doc.add_paragraph("—")
                 else:
@@ -697,21 +723,21 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
                             set_run(rr, bold=False, size=9, color="#111827")
             if off.comment.strip():
                 p = doc.add_paragraph()
-                run = p.add_run("Commentaire : ")
-                set_run(run, bold=True, size=10, color="#111827")
+                r = p.add_run("Commentaire : ")
+                set_run(r, bold=True, size=10, color="#111827")
                 doc.add_paragraph(off.comment)
 
     if tech:
         doc.add_paragraph("")
         add_subtitle(doc, "B) TECHNIQUE — Détail par prestataire")
-        for i, off in enumerate(tech[:2], start=1):
+        for off in tech[:2]:
             doc.add_paragraph("")
             add_subtitle(doc, f"{off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
             for post in TECH_POSTS:
                 items = off.selected.get(post, [])
                 p = doc.add_paragraph()
-                run = p.add_run(f"{post} :")
-                set_run(run, bold=True, size=10, color="#111827")
+                r = p.add_run(f"{post} :")
+                set_run(r, bold=True, size=10, color="#111827")
                 if not items:
                     doc.add_paragraph("—")
                 else:
@@ -722,8 +748,8 @@ def build_word(event_title: str, event_date: str, guests: int, catering: List[Of
                             set_run(rr, bold=False, size=9, color="#111827")
             if off.comment.strip():
                 p = doc.add_paragraph()
-                run = p.add_run("Conseil (synthèse) : ")
-                set_run(run, bold=True, size=10, color="#111827")
+                r = p.add_run("Conseil (synthèse) : ")
+                set_run(r, bold=True, size=10, color="#111827")
                 doc.add_paragraph(off.comment)
 
     buf = io.BytesIO()
@@ -785,9 +811,11 @@ tech_files = (tech_files or [])[:2]
 with st.spinner("Lecture des PDFs…"):
     catering_offers: List[Offer] = []
     tech_offers: List[Offer] = []
+
     for f in catering_files:
         txt = extract_pdf_text(f)
         catering_offers.append(parse_catering(txt, f.name))
+
     for f in tech_files:
         txt = extract_pdf_text(f)
         tech_offers.append(parse_tech(txt, f.name))
@@ -802,14 +830,13 @@ with tab1:
         for i, off in enumerate(catering_offers, start=1):
             with st.expander(f"{off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire (obligatoire)", value=off.vendor, key=f"c_vendor_{i}")
-                off.total_ttc = parse_eur_amount(
-                    st.text_input("Total TTC (hors options) — obligatoire", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"c_ttc_{i}")
-                )
+                ttc_in = st.text_input("Total TTC (hors options) — obligatoire", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"c_ttc_{i}")
+                off.total_ttc = parse_eur_amount(ttc_in)
 
                 if vendor_is_suspicious(off.vendor):
-                    st.error("Nom prestataire invalide/suspect. Corrige avant génération.")
+                    st.error("Nom prestataire invalide/suspect (titre interne, poste, contact ou adresse). Corrige-le.")
                 if off.total_ttc is None:
-                    st.warning("Total TTC non détecté — saisis-le avant génération.")
+                    st.warning("Total TTC non détecté — saisis-le.")
 
                 for post in CATERING_POSTS:
                     cand = off.candidates.get(post, [])
@@ -833,14 +860,13 @@ with tab2:
         for i, off in enumerate(tech_offers, start=1):
             with st.expander(f"{off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire (obligatoire)", value=off.vendor, key=f"t_vendor_{i}")
-                off.total_ttc = parse_eur_amount(
-                    st.text_input("Total TTC — obligatoire", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"t_ttc_{i}")
-                )
+                ttc_in = st.text_input("Total TTC — obligatoire", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"t_ttc_{i}")
+                off.total_ttc = parse_eur_amount(ttc_in)
 
                 if vendor_is_suspicious(off.vendor):
                     st.warning("Nom prestataire à vérifier.")
                 if off.total_ttc is None:
-                    st.warning("Total TTC non détecté — saisis-le avant génération.")
+                    st.warning("Total TTC non détecté — saisis-le.")
 
                 for post in TECH_POSTS:
                     cand = off.candidates.get(post, [])
@@ -848,27 +874,28 @@ with tab2:
                         continue
                     st.markdown(f"**{post}**")
                     sel = []
+                    default_n = 10 if post in ["Périmètre", "Captation", "Régie", "Diffusion"] else 8
                     for idx, line in enumerate(cand):
-                        checked = st.checkbox(line, value=(idx < 8), key=f"t_{i}_{post}_{idx}")
+                        checked = st.checkbox(line, value=(idx < default_n), key=f"t_{i}_{post}_{idx}")
                         if checked:
                             sel.append(line)
                     off.selected[post] = sel
 
                 off.comment = st.text_area("Conseil (2–3 phrases max)", value=off.comment, height=90, key=f"t_comment_{i}")
 
-# Gate: block generation if critical fields missing
+# Gate generation
 blocked = False
 for off in catering_offers:
-    if vendor_is_suspicious(off.vendor) or off.total_ttc is None:
+    if vendor_is_suspicious(off.vendor) or (off.total_ttc is None):
         blocked = True
 for off in tech_offers:
-    if (not off.vendor) or off.total_ttc is None:
+    if (not norm(off.vendor)) or (off.total_ttc is None):
         blocked = True
 
 st.divider()
 colA, colB = st.columns([2, 1], vertical_alignment="center")
 with colA:
-    st.caption("Contrôle qualité: génération bloquée si vendor/Total TTC manquants. Le Word contient uniquement les éléments cochés.")
+    st.caption("Contrôle qualité : génération bloquée si vendor/Total TTC manquants. Le Word contient uniquement les éléments cochés.")
 with colB:
     if st.button("Générer le Word premium (.docx)", use_container_width=True, type="primary", disabled=blocked):
         docx_bytes = build_word(

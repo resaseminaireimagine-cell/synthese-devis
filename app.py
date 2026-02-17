@@ -1,10 +1,15 @@
+# app.py
+# Synthèse devis prestataires — Institut Imagine
+# Objectif: Upload devis PDF (traiteur + technique) -> extraction robuste -> validation rapide -> export Word premium
+# Conçu pour éviter: CGV/IBAN/SIRET, tableaux de prix, numéros de page, "NET A PAYER" en vendor, bruit PDF marketing.
+
 import io
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Tuple
 
-import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
@@ -20,8 +25,7 @@ from docx.oxml.ns import qn
 # =========================
 APP_TITLE = "Synthèse devis prestataires — Institut Imagine"
 PRIMARY = "#AF0073"
-DARK = "#111827"
-MUTED = "#6B7280"
+BG = "#F6F7FB"
 
 CATERING_POSTS = [
     "Accueil café",
@@ -46,6 +50,29 @@ TECH_POSTS = [
     "Conseil",
 ]
 
+# Keywords used to detect "menu" lines (keep) vs admin noise (drop)
+MENU_HINTS = [
+    "café", "cafe", "thé", "the", "soft", "jus", "eau", "viennoiser",
+    "pause", "déjeuner", "dejeuner", "buffet", "cocktail", "apéritif", "aperitif",
+    "pièce", "pieces", "pièces", "par personne", "/pers", "convive", "invité",
+    "salée", "sucrée", "dessert", "sandwich", "wrap", "buns", "cake", "salade",
+    "fromage", "fruit", "mignard", "cannel", "financier", "tartelette", "sphère",
+    "saumon", "gambas", "volaille", "risotto", "briochin", "bresaola", "chèvre",
+    "vin", "champagne",
+]
+
+ADMIN_NOISE_HINTS = [
+    "conditions générales", "cgv", "siret", "rcs", "tva", "iban", "bic", "rib", "banque",
+    "capital", "pénalité", "recouvrement", "force majeure", "propriété intellectuelle",
+    "droit à l'image", "rgpd", "données personnelles",
+    "adresse", "tél", "tel", "email", "e-mail", "www.", "site internet",
+    "référence", "devis n", "date de devis", "date de validité", "signature",
+    "mode de paiement", "facture", "net a payer", "net à payer",
+    "désignation", "quantité", "p.u", "pu ht", "montant", "remise", "taux", "qté", "réf", "ref",
+    "base ht", "total ht", "total ttc", "page ",
+    "société générale", "caisse d'epargne", "caisse d’épargne", "cic",
+]
+
 
 # =========================
 # UTIL TEXT
@@ -53,7 +80,7 @@ TECH_POSTS = [
 def norm(s: str) -> str:
     s = "" if s is None else str(s)
     s = s.replace("\u00A0", " ")
-    s = s.replace("\t", " ").replace("\n", " ")
+    s = s.replace("\t", " ").replace("\r", " ")
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
     return s
@@ -63,70 +90,7 @@ def fold(s: str) -> str:
     return norm(s).lower()
 
 
-def extract_pdf_text(file) -> str:
-    reader = PdfReader(file)
-    parts = []
-    for page in reader.pages:
-        t = page.extract_text() or ""
-        parts.append(t)
-    return "\n".join(parts)
-
-
-def guess_vendor_name(text: str, filename: str) -> str:
-    # Heuristique simple : première ligne "forte" sinon nom de fichier
-    lines = [norm(x) for x in text.splitlines() if norm(x)]
-    for ln in lines[:25]:
-        if len(ln) >= 4 and len(ln) <= 60 and not re.search(r"\b(devis|facture|date|total|tva|siret|iban)\b", fold(ln)):
-            return ln
-    return filename.rsplit(".", 1)[0]
-
-
-def parse_eur_amount(s: str) -> float | None:
-    """
-    Parse "10 159,42" or "10159.42" -> float
-    """
-    s = norm(s)
-    s = s.replace("€", "").replace("EUR", "").replace("euros", "")
-    # keep digits, space, comma, dot
-    s = re.sub(r"[^0-9,.\s-]", "", s).strip()
-    if not s:
-        return None
-    # If comma is decimal separator
-    # Remove spaces thousand sep
-    s2 = s.replace(" ", "")
-    # If both comma and dot exist, assume dot thousand and comma decimal (rare) -> remove dots
-    if "," in s2 and "." in s2:
-        s2 = s2.replace(".", "")
-    # Now comma -> dot
-    s2 = s2.replace(",", ".")
-    try:
-        return float(s2)
-    except Exception:
-        return None
-
-
-def find_total_ttc(text: str) -> float | None:
-    """
-    Finds Total TTC or NET A PAYER patterns.
-    """
-    t = text
-    # Prefer "Total TTC"
-    patterns = [
-        r"total\s+ttc\s*[:\-]?\s*([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
-        r"net\s+a\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
-        r"total\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, fold(t), flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            amt = parse_eur_amount(m.group(1))
-            if amt is not None:
-                return amt
-    return None
-
-
 def split_lines(text: str) -> List[str]:
-    # Keep original-ish lines
     raw = text.splitlines()
     out = []
     for r in raw:
@@ -137,59 +101,270 @@ def split_lines(text: str) -> List[str]:
     return out
 
 
+def extract_pdf_text(uploaded_file) -> str:
+    reader = PdfReader(uploaded_file)
+    parts = []
+    for page in reader.pages:
+        t = page.extract_text() or ""
+        parts.append(t)
+    return "\n".join(parts)
+
+
+def parse_eur_amount(s: str) -> float | None:
+    s = norm(s)
+    if not s:
+        return None
+    s = s.replace("€", "").replace("EUR", "").replace("euros", "")
+    s = re.sub(r"[^0-9,.\s-]", "", s).strip()
+    if not s:
+        return None
+    s2 = s.replace(" ", "")
+    if "," in s2 and "." in s2:
+        s2 = s2.replace(".", "")
+    s2 = s2.replace(",", ".")
+    try:
+        return float(s2)
+    except Exception:
+        return None
+
+
+def euro_fmt(x: float | None) -> str:
+    if x is None:
+        return "—"
+    return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
+
+
+def find_total_ttc(text: str) -> float | None:
+    t = text
+    patterns = [
+        r"total\s+ttc\s*[:\-]?\s*([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
+        r"net\s+a\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
+        r"net\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
+        r"total\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
+    ]
+    lt = fold(t)
+    for pat in patterns:
+        m = re.search(pat, lt, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            amt = parse_eur_amount(m.group(1))
+            if amt is not None:
+                return amt
+    return None
+
+
+def looks_like_price_table_line(s: str) -> bool:
+    # Examples: "100 8,10 810,00 10,00 %", "2 715,00 1 430,00 10,00 %"
+    ss = norm(s)
+    if not ss:
+        return False
+    # mostly digits and separators and percent
+    core = re.sub(r"[€]", "", ss)
+    if re.fullmatch(r"[\d\s,\.%]+", core) and sum(ch.isdigit() for ch in core) >= 6:
+        return True
+    return False
+
+
+def is_noise_line(s: str) -> bool:
+    l = fold(s)
+
+    # page numbers alone
+    if re.fullmatch(r"\d{1,3}", s.strip()):
+        return True
+
+    # typical admin noise
+    if any(k in l for k in ADMIN_NOISE_HINTS):
+        return True
+
+    # heavy table lines
+    if looks_like_price_table_line(s):
+        return True
+
+    # repeated location/time boilerplate from marketing PDFs (Inédit)
+    if "institut imagine" in l and ("etage" in l or "étage" in l or "sur la base" in l):
+        return True
+
+    # pure time lines
+    if (re.search(r"\b\d{1,2}h\d{0,2}\b", l) or re.search(r"\bde\s+\d{1,2}h\d{0,2}\b", l)) and len(l) <= 40:
+        return True
+
+    return False
+
+
 def is_section_header(line: str) -> bool:
     l = fold(line)
-    # Common headers in FR catering + technique
+    # section headers: short lines containing these markers
     keys = [
         "accueil", "petit-déjeuner", "petit déjeuner",
         "pause", "déjeuner", "dejeuner", "buffet",
         "cocktail", "apéritif", "aperitif",
-        "boissons", "soft", "vin", "champagne",
+        "boissons", "rafraîchissements", "rafraichissements",
         "livraison", "service", "personnel", "location", "vaisselle", "nappage",
         "captation", "diffusion", "live", "zoom", "replay", "régie", "regie",
         "installation", "ingénieur", "ingenieur", "cadreur", "réalisateur", "realisateur",
         "inclus", "option", "conseil",
+        "prestation",
     ]
     return any(k in l for k in keys)
 
 
+def guess_vendor_name(text: str, filename: str) -> str:
+    """
+    Robust vendor guess:
+    - avoid picking "NET A PAYER"
+    - prefer uppercase-ish brand lines containing SAS/SARL/RECEPTIONS/PRODUCTION/TRAITEUR
+    """
+    lines = [norm(x) for x in text.splitlines() if norm(x)]
+    bad = re.compile(r"\b(devis|facture|date|total|tva|siret|iban|bic|net a payer|net à payer|net\s+a\s+payer)\b", re.I)
+
+    candidates = []
+    for ln in lines[:120]:
+        if len(ln) < 4 or len(ln) > 70:
+            continue
+        if bad.search(ln):
+            continue
+        if is_noise_line(ln):
+            continue
+        alpha = sum(ch.isalpha() for ch in ln)
+        if alpha < 6:
+            continue
+        # accept if mostly letters or uppercase
+        if (ln.upper() == ln) or (alpha / max(len(ln), 1) > 0.55):
+            candidates.append(ln)
+
+    if candidates:
+        prefer_keys = ["production", "réceptions", "receptions", "traiteur", "sas", "sarl", "unik", "exupery", "cadet", "inedit"]
+        for key in prefer_keys:
+            for c in candidates:
+                if key in fold(c):
+                    return c
+        return candidates[0]
+
+    return filename.rsplit(".", 1)[0]
+
+
+def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
+    """
+    List of (section_title, section_lines).
+    Avoid creating sections based on price-table headers.
+    """
+    sections: List[Tuple[str, List[str]]] = []
+    current_title = "Général"
+    current: List[str] = []
+
+    for ln in lines:
+        # guard: table header lines should never open a section
+        if re.fullmatch(r"(RÉF|REF|QTÉ|QTE|PU|PU HT|MONTANT|TVA|TAUX|BASE HT)\b.*", ln, flags=re.I):
+            current.append(ln)
+            continue
+
+        if is_section_header(ln) and (len(ln) <= 95) and (not ln.startswith(("•", "-", "–"))):
+            if current:
+                sections.append((current_title, current))
+            current_title = ln
+            current = []
+            continue
+
+        current.append(ln)
+
+    if current:
+        sections.append((current_title, current))
+
+    return sections
+
+
+def bulletize_menu_first(lines: List[str]) -> List[str]:
+    """
+    Menu-first extractor:
+    - keep bullets
+    - keep very few non-bullet lines if they look menu-related
+    - drop admin/tables/pages/CGV/IBAN etc.
+    """
+    items: List[str] = []
+
+    for ln in lines:
+        s = norm(ln)
+        if not s or is_noise_line(s):
+            continue
+
+        if s.startswith(("•", "-", "–")):
+            s2 = s.lstrip("•-– ").strip()
+            if s2 and not is_noise_line(s2):
+                items.append(s2)
+            continue
+
+        # Keep only if it smells like menu and not too long
+        l = fold(s)
+        if len(s) <= 120 and any(k in l for k in MENU_HINTS):
+            items.append(s)
+
+    # de-dup
+    out = []
+    seen = set()
+    for it in items:
+        k = fold(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
+
+
+def summarize_for_table(items: List[str], max_chars: int = 320) -> str:
+    if not items:
+        return ""
+    s = " • ".join(items)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 5].rstrip() + " (...)"
+
+
+# =========================
+# CLASSIFIERS
+# =========================
 def classify_catering_section(title: str) -> str:
     l = fold(title)
-    # time hints (08h30 etc.) decide morning/afternoon
-    # but we keep it simple: keyword first, time second.
+
     if "accueil" in l or "petit" in l:
         return "Accueil café"
+
     if "déjeuner" in l or "dejeuner" in l or "buffet" in l or "déjeunatoire" in l:
         return "Déjeuner"
+
     if "cocktail" in l or "apéritif" in l or "aperitif" in l:
-        # if "déjeunatoire" -> lunch
         if "déjeunatoire" in l:
             return "Déjeuner"
         return "Cocktail"
+
     if "pause" in l:
-        # try by time in title
+        # try time hint in header
         if re.search(r"\b(14|15|16)h", l):
             return "Pause après-midi"
         if re.search(r"\b(10|11|12)h", l):
             return "Pause matin"
         # default pause morning
         return "Pause matin"
-    if "boisson" in l or "soft" in l or "vin" in l or "champagne" in l:
+
+    if "boisson" in l or "soft" in l or "vin" in l or "rafraîch" in l or "rafraich" in l or "champagne" in l:
         return "Boissons (global)"
+
     if "option" in l:
         return "Options"
-    if "livraison" in l or "service" in l or "personnel" in l or "vaisselle" in l or "location" in l or "nappage" in l:
+
+    if any(k in l for k in ["livraison", "service", "personnel", "vaisselle", "location", "nappage", "scénographie", "scenographie"]):
         return "Autres (logistique)"
+
     return "Autres (logistique)"
 
 
 def classify_tech_section(title: str) -> str:
     l = fold(title)
+
     if "conseil" in l:
         return "Conseil"
     if "inclus" in l:
         return "Inclus"
-    if "équipe" in l or "ingenieur" in l or "ingénieur" in l or "cadreur" in l or "réalisateur" in l:
+    if "équipe" in l or "ingenieur" in l or "ingénieur" in l or "cadreur" in l or "réalisateur" in l or "realisateur" in l:
         return "Équipe"
     if "captation" in l or "caméra" in l or "camera" in l:
         return "Captation"
@@ -203,75 +378,8 @@ def classify_tech_section(title: str) -> str:
         return "Contraintes / options"
     if "prestation" in l or "incluant" in l or "installation" in l:
         return "Périmètre"
+
     return "Périmètre"
-
-
-def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
-    """
-    Returns list of (section_title, section_lines).
-    Heuristic: a line that looks like a header starts a new section.
-    """
-    sections = []
-    current_title = "Général"
-    current = []
-
-    for ln in lines:
-        # If line looks like a header, start new section
-        if is_section_header(ln) and (len(ln) <= 90):
-            # Avoid splitting too aggressively on bullet lines
-            if not ln.startswith(("•", "-", "–")):
-                # flush current
-                if current:
-                    sections.append((current_title, current))
-                current_title = ln
-                current = []
-                continue
-
-        current.append(ln)
-
-    if current:
-        sections.append((current_title, current))
-
-    return sections
-
-
-def bulletize(lines: List[str]) -> List[str]:
-    """
-    Keep bullets if present; also treat lines starting with • or - as bullets.
-    Returns clean bullet items.
-    """
-    items = []
-    for ln in lines:
-        l = norm(ln)
-        if not l:
-            continue
-        if l.startswith(("•", "-", "–")):
-            l2 = l.lstrip("•-– ").strip()
-            if l2:
-                items.append(l2)
-        else:
-            # keep short informative lines, but avoid table headings
-            if len(l) <= 140 and not re.fullmatch(r"(désignation|quantité|p\.u\.|montant|tva|total).*", fold(l)):
-                items.append(l)
-    # de-dup consecutive
-    out = []
-    for it in items:
-        if not out or fold(out[-1]) != fold(it):
-            out.append(it)
-    return out
-
-
-def summarize_for_table(items: List[str], max_chars: int = 320) -> str:
-    """
-    1-2 lines max. Joins with " • " and truncates.
-    """
-    if not items:
-        return ""
-    s = " • ".join(items)
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) <= max_chars:
-        return s
-    return s[: max_chars - 5].rstrip() + " (...)"
 
 
 # =========================
@@ -281,8 +389,7 @@ def summarize_for_table(items: List[str], max_chars: int = 320) -> str:
 class CateringOffer:
     vendor: str
     total_ttc: float | None
-    posts: Dict[str, List[str]]  # full items by post
-    options: List[str]
+    posts: Dict[str, List[str]]
     comment: str
 
 
@@ -291,7 +398,6 @@ class TechOffer:
     vendor: str
     total_ttc: float | None
     posts: Dict[str, List[str]]
-    options: List[str]
     comment: str
 
 
@@ -303,44 +409,46 @@ def parse_catering_offer(text: str, filename: str) -> CateringOffer:
     total_ttc = find_total_ttc(text)
 
     lines = split_lines(text)
-    sections = extract_sections(lines)
+
+    # Hard filter: remove lines that are pure noise before sectioning (reduces bad splits)
+    filtered_lines = [ln for ln in lines if not is_noise_line(ln)]
+
+    sections = extract_sections(filtered_lines)
 
     posts: Dict[str, List[str]] = {k: [] for k in CATERING_POSTS}
-    options: List[str] = []
 
     for title, body in sections:
         post = classify_catering_section(title)
-        items = bulletize(body)
+        items = bulletize_menu_first(body)
 
-        # Separate "options" if lines contain explicit option markers
+        # route "en option" lines explicitly to Options
         for it in items:
-            if "option" in fold(it) or "en option" in fold(it):
-                options.append(it)
+            if "en option" in fold(it) or fold(it).startswith("option"):
+                posts["Options"].append(it)
             else:
                 posts[post].append(it)
 
-    # Move explicit options into posts too (kept separate for table + details)
-    posts["Options"].extend(options)
-
-    # Light cleanup: keep only meaningful unique items per post
+    # de-dup + cleanup: drop too-short tokens
     for k in list(posts.keys()):
         cleaned = []
         seen = set()
         for it in posts[k]:
-            key = fold(it)
+            it2 = norm(it)
+            if len(it2) < 2:
+                continue
+            if re.fullmatch(r"\d{1,3}", it2):
+                continue
+            key = fold(it2)
             if key in seen:
                 continue
+            # final noise check
+            if is_noise_line(it2):
+                continue
             seen.add(key)
-            cleaned.append(it)
+            cleaned.append(it2)
         posts[k] = cleaned
 
-    return CateringOffer(
-        vendor=vendor,
-        total_ttc=total_ttc,
-        posts=posts,
-        options=options,
-        comment="",
-    )
+    return CateringOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment="")
 
 
 def parse_tech_offer(text: str, filename: str) -> TechOffer:
@@ -348,49 +456,60 @@ def parse_tech_offer(text: str, filename: str) -> TechOffer:
     total_ttc = find_total_ttc(text)
 
     lines = split_lines(text)
-    sections = extract_sections(lines)
+    filtered_lines = [ln for ln in lines if not is_noise_line(ln)]
+    sections = extract_sections(filtered_lines)
 
     posts: Dict[str, List[str]] = {k: [] for k in TECH_POSTS}
-    options: List[str] = []
 
     for title, body in sections:
         post = classify_tech_section(title)
-        items = bulletize(body)
+        items = bulletize_menu_first(body)  # reuse: it's basically "keep only useful lines"
 
+        # tech-specific: keep important non-bullet long lines if contain key words
+        extra = []
+        for ln in body:
+            s = norm(ln)
+            if not s or is_noise_line(s):
+                continue
+            l = fold(s)
+            if any(k in l for k in ["captation", "diffusion", "zoom", "replay", "wetransfer", "caméra", "camera", "régie", "regie", "ingénieur", "cadreur", "réalisateur", "installation", "direct"]):
+                if len(s) <= 180:
+                    extra.append(s)
+        items.extend(extra)
+
+        # de-dup
+        seen = set()
+        final = []
         for it in items:
-            if "option" in fold(it) or "forfait" in fold(it) or "connexion" in fold(it):
-                options.append(it)
-            else:
-                posts[post].append(it)
+            it2 = norm(it)
+            if not it2 or is_noise_line(it2):
+                continue
+            key = fold(it2)
+            if key in seen:
+                continue
+            seen.add(key)
+            final.append(it2)
+        posts[post].extend(final)
 
-    posts["Contraintes / options"].extend(options)
-
-    # de-dup
+    # final de-dup all posts
     for k in list(posts.keys()):
-        cleaned = []
+        out = []
         seen = set()
         for it in posts[k]:
             key = fold(it)
             if key in seen:
                 continue
             seen.add(key)
-            cleaned.append(it)
-        posts[k] = cleaned
+            out.append(it)
+        posts[k] = out
 
-    return TechOffer(
-        vendor=vendor,
-        total_ttc=total_ttc,
-        posts=posts,
-        options=options,
-        comment="",
-    )
+    return TechOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment="")
 
 
 # =========================
-# WORD GENERATION (PREMIUM-LIGHT)
+# WORD GENERATION
 # =========================
 def set_cell_shading(cell, fill_hex: str):
-    """Set cell background color."""
     fill_hex = fill_hex.replace("#", "")
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
@@ -418,7 +537,6 @@ def add_title(doc: Document, text: str):
     run = p.add_run(text)
     run.bold = True
     run.font.size = Pt(16)
-    run.font.name = "Calibri"
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
@@ -427,7 +545,6 @@ def add_subtitle(doc: Document, text: str):
     run = p.add_run(text)
     run.bold = True
     run.font.size = Pt(11)
-    run.font.color.rgb = None
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
@@ -435,124 +552,94 @@ def add_small(doc: Document, text: str):
     p = doc.add_paragraph()
     run = p.add_run(text)
     run.font.size = Pt(9)
-    run.font.color.rgb = None
 
 
-def add_hr(doc: Document):
-    doc.add_paragraph("")
-
-
-def euro_fmt(x: float | None) -> str:
-    if x is None:
-        return "—"
-    return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
-
-
-def build_word(
-    event_title: str,
-    event_date: str,
-    guests: int,
-    catering: List[CateringOffer],
-    tech: List[TechOffer],
-) -> bytes:
+def build_word(event_title: str, event_date: str, guests: int, catering: List[CateringOffer], tech: List[TechOffer]) -> bytes:
     doc = Document()
 
-    # Page setup
+    # page setup
     section = doc.sections[0]
     section.top_margin = Cm(1.6)
     section.bottom_margin = Cm(1.4)
     section.left_margin = Cm(1.6)
     section.right_margin = Cm(1.6)
 
-    # Header
     add_title(doc, "SYNTHÈSE DEVIS — PRESTATAIRES")
     add_subtitle(doc, f"{event_title} — {event_date} — Sur la base de {guests} convives")
     add_small(doc, f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    add_hr(doc)
+    doc.add_paragraph("")
 
-    # =========================
-    # PAGE 1 — CATERING SUMMARY TABLE
-    # =========================
+    # PAGE 1: Catering summary table (short on purpose)
     if catering:
         add_subtitle(doc, "1) PRESTATION TRAITEUR — Comparatif (synthèse)")
-
         vendors = catering[:3]
-        col_count = 1 + len(vendors)  # left label + vendors
+        col_count = 1 + len(vendors)
         table = doc.add_table(rows=1, cols=col_count)
-        table.autofit = True
 
-        # Header row
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Poste"
-        set_cell_shading(hdr_cells[0], PRIMARY)
-        hdr_cells[0].paragraphs[0].runs[0].font.color.rgb = None
-        hdr_cells[0].paragraphs[0].runs[0].font.bold = True
+        hdr = table.rows[0].cells
+        hdr[0].text = "Poste"
+        set_cell_shading(hdr[0], PRIMARY)
+        for run in hdr[0].paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(10)
 
         for i, off in enumerate(vendors, start=1):
-            hdr_cells[i].text = off.vendor
-            set_cell_shading(hdr_cells[i], PRIMARY)
-            for r in hdr_cells[i].paragraphs[0].runs:
-                r.font.bold = True
-                r.font.size = Pt(10)
+            hdr[i].text = off.vendor
+            set_cell_shading(hdr[i], PRIMARY)
+            for run in hdr[i].paragraphs[0].runs:
+                run.bold = True
+                run.font.size = Pt(10)
 
-        for cell in hdr_cells:
+        for cell in hdr:
             set_cell_margins(cell)
 
-        # Rows
-        summary_rows = [
-            ("Total TTC (hors options)", lambda o: [euro_fmt(o.total_ttc)]),
-            ("Accueil café", lambda o: [summarize_for_table(o.posts.get("Accueil café", []), 280)]),
-            ("Pause matin", lambda o: [summarize_for_table(o.posts.get("Pause matin", []), 280)]),
-            ("Déjeuner", lambda o: [summarize_for_table(o.posts.get("Déjeuner", []), 320)]),
-            ("Pause après-midi", lambda o: [summarize_for_table(o.posts.get("Pause après-midi", []), 280)]),
-            ("Cocktail", lambda o: [summarize_for_table(o.posts.get("Cocktail", []), 320)]),
-            ("Boissons (global)", lambda o: [summarize_for_table(o.posts.get("Boissons (global)", []), 220)]),
-            ("Options", lambda o: [summarize_for_table(o.posts.get("Options", []), 220)]),
-            ("Commentaire", lambda o: [norm(o.comment)[:220] + (" (...)" if len(norm(o.comment)) > 220 else "")]),
+        # keep page 1 readable: focus decision rows
+        rows = [
+            ("Total TTC (hors options)", lambda o: euro_fmt(o.total_ttc)),
+            ("Déjeuner", lambda o: summarize_for_table(o.posts.get("Déjeuner", []), 360)),
+            ("Cocktail", lambda o: summarize_for_table(o.posts.get("Cocktail", []), 360)),
+            ("Options", lambda o: summarize_for_table(o.posts.get("Options", []), 240)),
+            ("Commentaire", lambda o: (norm(o.comment)[:240] + (" (...)" if len(norm(o.comment)) > 240 else ""))),
         ]
 
-        for label, fn in summary_rows:
-            row_cells = table.add_row().cells
-            row_cells[0].text = label
-            row_cells[0].paragraphs[0].runs[0].font.bold = True
-            row_cells[0].paragraphs[0].runs[0].font.size = Pt(9)
-            set_cell_shading(row_cells[0], "F3F4F6")
-            set_cell_margins(row_cells[0])
+        for label, fn in rows:
+            r = table.add_row().cells
+            r[0].text = label
+            set_cell_shading(r[0], "F3F4F6")
+            for run in r[0].paragraphs[0].runs:
+                run.bold = True
+                run.font.size = Pt(9)
+            set_cell_margins(r[0])
 
             for j, off in enumerate(vendors, start=1):
-                val = fn(off)[0]
-                row_cells[j].text = val if val else "—"
-                # style
-                for p in row_cells[j].paragraphs:
-                    for run in p.runs:
+                val = fn(off)
+                r[j].text = val if val else "—"
+                for para in r[j].paragraphs:
+                    for run in para.runs:
                         run.font.size = Pt(9)
-                set_cell_margins(row_cells[j])
+                set_cell_margins(r[j])
 
-        add_hr(doc)
+        doc.add_paragraph("")
 
-    # =========================
-    # PAGE 1 — TECH SUMMARY TABLE
-    # =========================
+    # PAGE 1: Tech summary tables (light)
     if tech:
         add_subtitle(doc, "2) PRESTATION TECHNIQUE — Synthèse")
-        # 2-column table per tech offer (keep it light)
         for idx, off in enumerate(tech[:2], start=1):
             add_small(doc, f"Prestataire technique {idx} : {off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
 
             t = doc.add_table(rows=1, cols=2)
-            t.autofit = True
             h = t.rows[0].cells
             h[0].text = "Item"
             h[1].text = "Détail"
             set_cell_shading(h[0], PRIMARY)
             set_cell_shading(h[1], PRIMARY)
             for cell in h:
-                for r in cell.paragraphs[0].runs:
-                    r.font.bold = True
-                    r.font.size = Pt(10)
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
+                    run.font.size = Pt(10)
                 set_cell_margins(cell)
 
-            rows = [
+            items = [
                 ("Périmètre", summarize_for_table(off.posts.get("Périmètre", []), 420)),
                 ("Équipe", summarize_for_table(off.posts.get("Équipe", []), 420)),
                 ("Captation", summarize_for_table(off.posts.get("Captation", []), 420)),
@@ -563,36 +650,33 @@ def build_word(
                 ("Contraintes / options", summarize_for_table(off.posts.get("Contraintes / options", []), 420)),
                 ("Conseil", norm(off.comment)[:420] + (" (...)" if len(norm(off.comment)) > 420 else "")),
             ]
-            for k, v in rows:
-                rc = t.add_row().cells
-                rc[0].text = k
-                rc[1].text = v if v else "—"
-                rc[0].paragraphs[0].runs[0].font.bold = True
-                rc[0].paragraphs[0].runs[0].font.size = Pt(9)
-                set_cell_shading(rc[0], "F3F4F6")
-                for cell in rc:
+            for k, v in items:
+                rr = t.add_row().cells
+                rr[0].text = k
+                rr[1].text = v if v else "—"
+                set_cell_shading(rr[0], "F3F4F6")
+                for run in rr[0].paragraphs[0].runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+                for cell in rr:
                     set_cell_margins(cell)
-                    for p in cell.paragraphs:
-                        for run in p.runs:
+                    for para in cell.paragraphs:
+                        for run in para.runs:
                             run.font.size = Pt(9)
 
-            add_hr(doc)
+            doc.add_paragraph("")
 
-    # =========================
-    # DETAILS — MENUS (EXHAUSTIVE)
-    # =========================
-    # Start details section on new page
+    # DETAILS pages (exhaustive but still cleaned)
     doc.add_page_break()
     add_title(doc, "DÉTAIL DES OFFRES (menus exhaustifs)")
-    add_small(doc, "Objectif : permettre la vérification fine des pièces / contenus par poste.")
+    add_small(doc, "Objectif : vérification fine des pièces / contenus. Le texte a été nettoyé automatiquement (CGV/IBAN/pages supprimés).")
 
-    # Catering details
     if catering:
-        add_hr(doc)
+        doc.add_paragraph("")
         add_subtitle(doc, "A) TRAITEUR — Détail par prestataire")
 
         for i, off in enumerate(catering[:3], start=1):
-            add_hr(doc)
+            doc.add_paragraph("")
             add_subtitle(doc, f"PROPOSITION {i} — {off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
 
             for post in ["Accueil café", "Pause matin", "Déjeuner", "Pause après-midi", "Cocktail", "Boissons (global)", "Options", "Autres (logistique)"]:
@@ -606,7 +690,7 @@ def build_word(
                     doc.add_paragraph("—")
                 else:
                     for it in items:
-                        para = doc.add_paragraph(it, style=None)
+                        para = doc.add_paragraph(it)
                         para.style = doc.styles["List Bullet"]
 
             if off.comment.strip():
@@ -615,12 +699,12 @@ def build_word(
                 r.bold = True
                 doc.add_paragraph(off.comment)
 
-    # Tech details
     if tech:
-        add_hr(doc)
+        doc.add_paragraph("")
         add_subtitle(doc, "B) TECHNIQUE — Détail par prestataire")
+
         for i, off in enumerate(tech[:2], start=1):
-            add_hr(doc)
+            doc.add_paragraph("")
             add_subtitle(doc, f"PRESTATION TECHNIQUE {i} — {off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
 
             for post in TECH_POSTS:
@@ -643,7 +727,6 @@ def build_word(
                 r.bold = True
                 doc.add_paragraph(off.comment)
 
-    # Save to bytes
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -662,7 +745,7 @@ html, body, .stApp, [class*="css"] {{
   font-family: 'Montserrat', sans-serif !important;
 }}
 header[data-testid="stHeader"] {{ display: none; }}
-.stApp {{ background: #F6F7FB; }}
+.stApp {{ background: {BG}; }}
 [data-testid="stHorizontalBlock"] {{
   background: white;
   border-radius: 16px;
@@ -686,10 +769,9 @@ header[data-testid="stHeader"] {{ display: none; }}
 )
 
 st.markdown(f"## {APP_TITLE}")
-st.caption("Upload devis PDF → extraction automatique → validation rapide → export Word (synthèse + détails exhaustifs).")
+st.caption("Upload devis PDF → extraction nettoyée (menus-first) → validation rapide → export Word (synthèse + détails).")
 st.divider()
 
-# Event info
 c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="center")
 with c1:
     event_title = st.text_input("Événement (titre court)", placeholder="Ex : Journée scientifique — Colloque Génétique et Société")
@@ -708,11 +790,9 @@ if (not catering_files) and (not tech_files):
     st.info("Commence par uploader au moins un devis PDF.")
     st.stop()
 
-# Limit counts
 catering_files = (catering_files or [])[:3]
 tech_files = (tech_files or [])[:2]
 
-# Parse
 st.markdown("### Extraction & validation")
 catering_offers: List[CateringOffer] = []
 tech_offers: List[TechOffer] = []
@@ -726,24 +806,25 @@ with st.spinner("Lecture des PDFs…"):
         txt = extract_pdf_text(f)
         tech_offers.append(parse_tech_offer(txt, f.name))
 
-# Validation UI
 tab1, tab2 = st.tabs(["Traiteur", "Technique"])
 
 with tab1:
     if not catering_offers:
         st.caption("Aucun devis traiteur uploadé.")
     else:
-        st.caption("Corrige rapidement si besoin : nom prestataire, total TTC, contenus par poste, commentaire.")
+        st.caption("Corrige : nom prestataire, total TTC, contenus par poste. Les CGV/IBAN/pages sont filtrés automatiquement.")
         for idx, off in enumerate(catering_offers, start=1):
             with st.expander(f"PROPOSITION {idx} — {off.vendor}", expanded=(idx == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"c_vendor_{idx}")
-                ttc_str = st.text_input("Total TTC (hors options) — si vide, saisis-le", value=(""
-                                                                                               if off.total_ttc is None
-                                                                                               else euro_fmt(off.total_ttc)),
-                                        key=f"c_ttc_{idx}")
-                # Parse back
-                ttc_val = parse_eur_amount(ttc_str)
-                off.total_ttc = ttc_val
+
+                ttc_str = st.text_input(
+                    "Total TTC (hors options) — si non détecté, saisis-le",
+                    value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)),
+                    key=f"c_ttc_{idx}",
+                )
+                off.total_ttc = parse_eur_amount(ttc_str)
+                if off.total_ttc is None:
+                    st.warning("Total TTC non détecté — saisis-le manuellement pour la synthèse direction.")
 
                 colL, colR = st.columns(2)
                 with colL:
@@ -763,17 +844,20 @@ with tab2:
     if not tech_offers:
         st.caption("Aucun devis technique uploadé.")
     else:
-        st.caption("Corrige rapidement : nom prestataire, total TTC, périmètre, inclus, options, conseil.")
+        st.caption("Corrige : nom prestataire, total TTC, périmètre / inclus / options / conseil.")
         for idx, off in enumerate(tech_offers, start=1):
             with st.expander(f"TECHNIQUE {idx} — {off.vendor}", expanded=(idx == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"t_vendor_{idx}")
-                ttc_str = st.text_input("Total TTC — si vide, saisis-le", value=(""
-                                                                                 if off.total_ttc is None
-                                                                                 else euro_fmt(off.total_ttc)),
-                                        key=f"t_ttc_{idx}")
-                off.total_ttc = parse_eur_amount(ttc_str)
 
-                # Compact layout
+                ttc_str = st.text_input(
+                    "Total TTC — si non détecté, saisis-le",
+                    value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)),
+                    key=f"t_ttc_{idx}",
+                )
+                off.total_ttc = parse_eur_amount(ttc_str)
+                if off.total_ttc is None:
+                    st.warning("Total TTC non détecté — saisis-le manuellement pour la synthèse direction.")
+
                 col1, col2 = st.columns(2)
                 with col1:
                     for post in ["Périmètre", "Équipe", "Captation", "Régie"]:
@@ -790,10 +874,9 @@ with tab2:
 
 st.divider()
 
-# Generate doc
 colA, colB = st.columns([2, 1], vertical_alignment="center")
 with colA:
-    st.caption("Conseil : garde la synthèse très courte, et mets l’exhaustif dans les menus détaillés.")
+    st.caption("Page 1 = synthèse décisionnelle (TTC + déjeuner + cocktail + options). Détails = menus exhaustifs nettoyés.")
 with colB:
     if st.button("Générer le Word (.docx)", use_container_width=True, type="primary"):
         docx_bytes = build_word(

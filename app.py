@@ -31,7 +31,7 @@ from docx.oxml.ns import qn
 # =========================
 # BRAND / UI
 # =========================
-APP_TITLE = "Synthèse devis prestataires — Institut Imagine"
+APP_TITLE = "Lola — Institut Imagine"
 PRIMARY = "#AF0073"
 BG = "#F6F7FB"
 FONT = "Montserrat"

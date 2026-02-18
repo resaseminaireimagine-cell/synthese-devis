@@ -1,17 +1,16 @@
-# app.py — Synthèse devis prestataires (FINAL: résumé intelligent + détail éditable)
-# ------------------------------------------------------------------------------
-# Objectif:
-# - Tableau 1 (comparatif) = résumé "lisible" (ex: 10 pièces = 5 salées + 2 sucrées)
-# - Détail = listes complètes (pièces cocktail, menus, art de la table, etc.)
-# - Vendor robuste: stop adresses / "EN EUROS" / "APPLIQUÉ"
-# - Nettoyage: IBAN/SIRET/adresses/contacts ne polluent plus les postes
-# ------------------------------------------------------------------------------
+# app.py — Synthèse devis prestataires (FINAL++)
+# ---------------------------------------------
+# Fixes:
+# - Vendor: priorité au nom du fichier + correction "SAS ... au capital ..." + blacklist "PRIX PAR CONVIVE"
+# - Détail: filtre strict admin/adresses/headers tables/page x
+# - Tech: filtre TVA (sans tuer "TV 55")
+# - Synthèse: Options & Logistique = tags courts, pas pavés
 
 import io
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import streamlit as st
 from pypdf import PdfReader
@@ -30,6 +29,7 @@ APP_TITLE = "Synthèse devis prestataires — Institut Imagine"
 PRIMARY = "#AF0073"
 BG = "#F6F7FB"
 FONT = "Montserrat"
+
 
 CATERING_POSTS = [
     "Accueil café",
@@ -62,13 +62,14 @@ MENU_HINTS = [
     "accueil", "petit", "déjeuner", "dejeuner", "pause", "buffet", "cocktail", "apéritif", "aperitif",
     "déjeunatoire", "dejeunatoire",
     "café", "cafe", "thé", "the", "soft", "jus", "eau",
-    "viennoiser", "gourmand", "mignard",
+    "viennoiser", "gourmand", "mignard", "financier", "cannel",
     "pièce", "pieces", "pièces", "/pers", "par personne", "convive", "invité", "invite",
-    "salée", "sucrée", "sucree", "dessert",
+    "salée", "sucrée", "sucree",
     "sandwich", "wrap", "salade", "fromage", "fruit",
     "vin", "champagne", "bière", "biere",
     "thermos", "gobelet", "tasse", "serviette", "plateau",
     "verrerie", "flûtes", "assiettes", "nappage", "mobilier", "mange-debout",
+    "livraison", "reprise", "mise en place", "personnel", "service",
 ]
 
 TECH_HINTS = [
@@ -84,25 +85,29 @@ LEGAL_FORMS = ["sas", "sarl", "sa", "eurl", "sasu", "association", "scop", "grou
 
 ADDRESS_HINTS = [
     "rue", "avenue", "boulevard", "allée", "allee", "bp", "cedex",
-    "paris", "france", "clichy", "nanterre", "saint",
+    "france", "paris", "clichy", "nanterre", "saint",
 ]
 
 VENDOR_FORBIDDEN = [
-    "en euros", "appliqué", "applique", "devis", "facture", "total", "ttc", "ht",
-    "désignation", "designation", "quantité", "quantite", "montant", "tva", "base ht",
+    "en euros", "appliqué", "applique", "devis", "facture",
+    "désignation", "designation", "quantité", "quantite",
+    "montant", "tva", "base ht", "total", "ttc", "ht",
     "récapitulatif", "recapitulatif", "proposition", "prestation",
+    "prix par convive",
+    "au capital",
 ]
 
-# Hard admin/boilerplate to remove from bodies (also used to siphon into admin_lines)
 ADMIN_HINTS = [
     "conditions générales", "conditions generales", "cgv",
     "rgpd", "données personnelles", "donnees personnelles",
     "iban", "bic", "rib", "banque", "tva intracommunautaire",
     "siret", "rcs", "capital",
-    "adresse", "tél", "tel", "email", "e-mail",
+    "adresse", "tél", "tel", "email", "e-mail", "site internet", "www.",
     "référence", "reference", "date de devis", "date de validité", "signature",
     "mode de paiement", "net à payer", "net a payer",
     "tribunal", "mise en demeure", "penalite", "pénalité",
+    "indemnité forfaitaire", "indemnite forfaitaire",
+    "page ",
 ]
 
 
@@ -155,16 +160,7 @@ def cut_at_cgv(lines: List[str]) -> List[str]:
 
 def looks_like_schedule_line(s: str) -> bool:
     l = fold(s)
-    return bool(re.search(r"\b0?\d{1,2}h\d{2}\b", l) and (" à " in l or " a " in l or "-" in l) and len(l) <= 180)
-
-
-def looks_like_placeholder_line(s: str) -> bool:
-    ss = norm(s)
-    if re.match(r"^\s*:\s*[A-Za-zÀ-ÖØ-öø-ÿ].{0,120}:\s*", ss):
-        return True
-    if ss.strip().startswith(":") and re.search(r"\b(pax|nb pax|nombre de pax)\b", fold(ss)):
-        return True
-    return False
+    return bool(re.search(r"\b0?\d{1,2}h\d{2}\b", l) and ((" à " in l) or (" a " in l) or ("-" in l)) and len(l) <= 220)
 
 
 def looks_like_price_table_line(s: str) -> bool:
@@ -178,17 +174,32 @@ def looks_like_price_table_line(s: str) -> bool:
     return False
 
 
+def is_addressy(s: str) -> bool:
+    l = fold(s)
+    hits = sum(k in l for k in ADDRESS_HINTS)
+    has_cp = bool(re.search(r"\b\d{5}\b", l))
+    return hits >= 2 or (hits >= 1 and has_cp)
+
+
 def is_admin_line(s: str) -> bool:
     l = fold(s)
     if any(k in l for k in ADMIN_HINTS):
         return True
-    # IBAN-like
-    if re.search(r"\bFR\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{2}\b", s.replace(" ", "")):
+    # page x sur y
+    if re.search(r"\bpage\s+\d+\s+sur\s+\d+\b", l):
         return True
-    # emails, phone
+    # IBAN
+    compact = re.sub(r"\s+", "", s)
+    if re.search(r"\bFR\d{2}[0-9A-Z]{10,30}\b", compact):
+        return True
+    # emails
     if "@" in s:
         return True
+    # phone FR
     if re.search(r"\b0[1-9](\s?\d{2}){4}\b", s):
+        return True
+    # common table headers
+    if re.search(r"\b(désignation|designation|quantité|quantite|montant|p\.u|pu ht|base ht|total ht|total tva)\b", l):
         return True
     return False
 
@@ -197,14 +208,13 @@ def is_noise_line(s: str) -> bool:
     s = norm(s)
     if not s:
         return True
-    if looks_like_placeholder_line(s):
-        return True
     if looks_like_schedule_line(s):
+        # on garde les horaires en logistique si tu veux, donc pas du bruit
+        return False
+    if looks_like_price_table_line(s):
+        return False  # on traite ailleurs (extraction label)
+    if re.fullmatch(r"\d{1,6}", s):
         return True
-    # page numbers
-    if re.fullmatch(r"\d{1,5}", s):
-        return True
-    # hard admin
     if is_admin_line(s):
         return True
     return False
@@ -240,6 +250,7 @@ def find_total_ttc(text: str) -> Optional[float]:
         r"net\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
         r"net\s+a\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
         r"total\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
+        r"total\s+devis\s+t\.t\.c\.\s*[:\-]?\s*([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
     ]
     lt = fold(text)
     found: List[float] = []
@@ -252,13 +263,114 @@ def find_total_ttc(text: str) -> Optional[float]:
 
 
 # =========================
-# TABULAR LABEL EXTRACTION
+# VENDOR FROM FILENAME (strong fallback)
+# =========================
+def vendor_from_filename(filename: str) -> str:
+    base = filename.rsplit(".", 1)[0]
+    base = re.sub(r"[_\-]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+
+    # remove common junk tokens
+    junk = {"v1", "v2", "v3", "devis", "dev", "facture", "institut", "imagine", "pax", "100pax", "02032025"}
+    tokens = [t for t in re.split(r"\s+", base) if t]
+    kept = []
+    for t in tokens:
+        tl = t.lower()
+        if tl in junk:
+            continue
+        if re.fullmatch(r"\d{3,}", tl):
+            continue
+        if re.fullmatch(r"de[\-_]?\d+", tl):
+            continue
+        kept.append(t)
+
+    # heuristic: keep first chunk of words until a date-ish/number-ish block
+    out = []
+    for t in kept:
+        if re.search(r"\d", t) and len(out) >= 2:
+            break
+        out.append(t)
+        if len(out) >= 4:
+            break
+
+    candidate = " ".join(out).strip()
+    return candidate if candidate else base
+
+
+def vendor_is_suspicious(v: str) -> bool:
+    v = norm(v)
+    lv = fold(v)
+
+    if not v or len(v) < 3:
+        return True
+    if any(k in lv for k in VENDOR_FORBIDDEN):
+        return True
+    if is_addressy(v):
+        return True
+    if "@" in v or "contact" in lv:
+        return True
+    # mostly digits
+    if sum(ch.isdigit() for ch in v) >= 8 and sum(ch.isalpha() for ch in v) <= 4:
+        return True
+    return False
+
+
+def normalize_company_line(line: str) -> str:
+    s = norm(line)
+    l = fold(s)
+    # turn "SAS au capital de ..." -> "SAS XXX" (or drop "au capital...")
+    if "au capital" in l:
+        s = re.split(r"(?i)\bau capital\b", s)[0].strip(" -–,;:")
+    # kill trailing address-like
+    if is_addressy(s) and len(s) > 24:
+        # often "LE CERCLE - 10 bis rue ..." -> keep before dash
+        s = s.split(" - ")[0].strip()
+    return s
+
+
+def guess_vendor_name(text: str, filename: str) -> str:
+    file_vendor = vendor_from_filename(filename)
+
+    lines = [normalize_company_line(x) for x in text.splitlines() if norm(x)]
+    top = lines[:260]
+
+    # (1) legal form line but not "au capital"
+    legal_candidates = []
+    for ln in top:
+        l = fold(ln)
+        if any(f" {lf} " in f" {l} " for lf in LEGAL_FORMS):
+            cand = normalize_company_line(ln)
+            if not vendor_is_suspicious(cand):
+                legal_candidates.append(cand)
+    if legal_candidates:
+        legal_candidates.sort(key=lambda x: len(x))
+        best = legal_candidates[0]
+        return best
+
+    # (2) above SIRET
+    for idx, ln in enumerate(top):
+        l = fold(ln)
+        if "siret" in l or "rcs" in l:
+            for back in range(1, 12):
+                j = idx - back
+                if j >= 0:
+                    cand = normalize_company_line(top[j])
+                    if cand and not vendor_is_suspicious(cand) and sum(ch.isalpha() for ch in cand) >= 6:
+                        return cand
+            break
+
+    # (3) fallback: filename
+    return file_vendor
+
+
+# =========================
+# TABULAR label extraction (keep left side)
 # =========================
 def extract_left_label_from_tabular(line: str) -> Optional[str]:
     s = norm(line)
     if len(s) < 6:
         return None
-    if looks_like_placeholder_line(s):
+    if is_admin_line(s):
         return None
 
     parts = s.split()
@@ -274,18 +386,57 @@ def extract_left_label_from_tabular(line: str) -> Optional[str]:
     if len(left) < 4:
         return None
     ll = fold(left)
-    if any(k in ll for k in ADDRESS_HINTS):
-        return None
     if any(k in ll for k in ["total", "tva", "montant", "remise", "désignation", "designation", "quantité", "quantite"]):
+        return None
+    if is_addressy(left):
         return None
     return left
 
 
-def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: bool) -> List[str]:
+# =========================
+# DETAIL FILTERS (key)
+# =========================
+def should_keep_catering_detail(item: str) -> bool:
+    s = norm(item)
+    l = fold(s)
+    if not s:
+        return False
+    if is_admin_line(s):
+        return False
+    if any(k in l for k in ["institut imagine", "a l'attention", "votre contact", "contact client"]):
+        return False
+    if is_addressy(s):
+        return False
+    # block table header leftovers
+    if re.search(r"\b(code description|montant ht|montant tva|base ht|désignation|designation)\b", l):
+        return False
+    return True
+
+
+def should_keep_tech_detail(item: str) -> bool:
+    s = norm(item)
+    l = fold(s)
+    if not s:
+        return False
+    if is_admin_line(s):
+        return False
+    # remove TVA but keep TV
+    if re.search(r"\btva\b", l) or "total tva" in l:
+        return False
+    if is_addressy(s) and "périmètre" not in l:
+        # perimeter can include address sometimes, ok
+        return False
+    return True
+
+
+# =========================
+# EXTRACTION ITEMS
+# =========================
+def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: bool, tabular_labels: bool) -> List[str]:
     items: List[str] = []
     for ln in lines:
         s = norm(ln)
-        if not s or is_noise_line(s):
+        if not s:
             continue
 
         if s.startswith(("•", "-", "–")):
@@ -294,10 +445,13 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
                 items.append(it)
             continue
 
-        if looks_like_price_table_line(s):
+        if looks_like_price_table_line(s) and tabular_labels:
             lab = extract_left_label_from_tabular(s)
             if lab:
                 items.append(lab)
+            continue
+
+        if is_noise_line(s):
             continue
 
         l = fold(s)
@@ -306,7 +460,6 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
                 items.append(s)
                 continue
             if relax:
-                # accept “menu-ish” lines that are not admin
                 if sum(ch.isalpha() for ch in s) >= 10 and not is_admin_line(s):
                     items.append(s)
                     continue
@@ -323,87 +476,6 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
 
 
 # =========================
-# VENDOR
-# =========================
-def is_addressy(s: str) -> bool:
-    l = fold(s)
-    hits = sum(k in l for k in ADDRESS_HINTS)
-    has_cp = bool(re.search(r"\b\d{5}\b", l))
-    return hits >= 2 or (hits >= 1 and has_cp)
-
-
-def vendor_is_suspicious(v: str) -> bool:
-    v = norm(v)
-    lv = fold(v)
-
-    if not v or len(v) < 3:
-        return True
-    if any(k in lv for k in VENDOR_FORBIDDEN):
-        return True
-    if is_addressy(v):
-        return True
-    if "@" in v or "contact" in lv:
-        return True
-    # looks like IBAN/FR...
-    compact = re.sub(r"\s+", "", v)
-    if re.fullmatch(r"FR\d{8,20}", compact):
-        return True
-    # mostly digits
-    if sum(ch.isdigit() for ch in v) >= 8 and sum(ch.isalpha() for ch in v) <= 4:
-        return True
-    return False
-
-
-def guess_vendor_name(text: str, filename: str) -> str:
-    lines = [norm(x) for x in text.splitlines() if norm(x)]
-    top = lines[:260]
-
-    # (1) best: line with legal form (SAS/SARL/...)
-    legal_candidates = []
-    for ln in top:
-        l = fold(ln)
-        if any(f" {lf} " in f" {l} " for lf in LEGAL_FORMS):
-            if not vendor_is_suspicious(ln):
-                legal_candidates.append(ln)
-    # choose the shortest legal form candidate (often "SAS EXUPERY", not an address)
-    if legal_candidates:
-        legal_candidates.sort(key=lambda x: len(x))
-        return legal_candidates[0]
-
-    # (2) anchor: above SIRET/RCS
-    for idx, ln in enumerate(top):
-        l = fold(ln)
-        if "siret" in l or "rcs" in l or "tva intracommunautaire" in l:
-            for back in range(1, 12):
-                j = idx - back
-                if j >= 0:
-                    cand = top[j].strip()
-                    if cand and not vendor_is_suspicious(cand) and sum(ch.isalpha() for ch in cand) >= 6:
-                        return cand
-            break
-
-    # (3) fallback: uppercase-ish candidate without address
-    candidates = []
-    for ln in top:
-        if vendor_is_suspicious(ln):
-            continue
-        alpha = sum(ch.isalpha() for ch in ln)
-        if alpha < 6:
-            continue
-        upper_ratio = sum(ch.isupper() for ch in ln if ch.isalpha()) / max(1, alpha)
-        if ln.upper() == ln or upper_ratio >= 0.65:
-            candidates.append(ln)
-    if candidates:
-        candidates.sort(key=lambda x: (is_addressy(x), len(x)))
-        return candidates[0]
-
-    # fallback filename
-    base = filename.rsplit(".", 1)[0]
-    base = re.sub(r"\s+", " ", base).strip()
-    return base
-
-
-# =========================
 # ROUTING (item -> post)
 # =========================
 def route_catering_item(item: str) -> str:
@@ -414,7 +486,6 @@ def route_catering_item(item: str) -> str:
     if "déjeuner" in l or "dejeuner" in l or "buffet" in l or "wrap" in l or "sandwich" in l or "salade" in l or "plat" in l:
         return "Déjeuner"
     if "pause" in l or "viennoiser" in l or "gourmand" in l or "mignard" in l or "financier" in l or "cannel" in l:
-        # si on voit 14h/15h/16h, bascule après-midi
         if re.search(r"\b(14h|15h|16h|17h)\b", l):
             return "Pause après-midi"
         return "Pause matin"
@@ -435,7 +506,7 @@ def route_tech_item(item: str) -> str:
         return "Équipe"
     if any(k in l for k in ["caméra", "camera", "4k", "objectif", "pied", "captation"]):
         return "Captation"
-    if any(k in l for k in ["régie", "regie", "mélangeur", "melangeur", "obs", "vmix", "console", "écran", "ecran", "tv", "pavlov", "zapette"]):
+    if any(k in l for k in ["régie", "regie", "mélangeur", "melangeur", "obs", "vmix", "console", "écran", "ecran", "pavlov", "zapette", "tv 55"]):
         return "Régie"
     if any(k in l for k in ["zoom", "live", "duplex", "diffusion", "plateforme", "stream"]):
         return "Diffusion"
@@ -449,15 +520,9 @@ def route_tech_item(item: str) -> str:
 
 
 # =========================
-# SUMMARY GENERATION (THE MAGIC)
+# SUMMARY GENERATION
 # =========================
 def extract_piece_counts(texts: List[str]) -> Dict[str, int]:
-    """
-    Detect patterns like:
-    - "10 pièces par personne"
-    - "5 pièces cocktail salées"
-    - "2 pièces cocktail sucrées"
-    """
     joined = " \n ".join(texts)
     lj = fold(joined)
 
@@ -471,16 +536,26 @@ def extract_piece_counts(texts: List[str]) -> Dict[str, int]:
             return None
 
     total = find_int(r"\b(\d{1,2})\s*pi[eè]ces?\s*(par\s+personne|/pers|par\s+convive)")
-    sale = find_int(r"\b(\d{1,2})\s*pi[eè]ces?.{0,20}(sal[ée]es?|froides?)")
-    sucre = find_int(r"\b(\d{1,2})\s*pi[eè]ces?.{0,20}(sucr[ée]es?)")
+    sale = find_int(r"\b(\d{1,2})\s*pi[eè]ces?.{0,30}(sal[ée]es?|froides?)")
+    sucre = find_int(r"\b(\d{1,2})\s*pi[eè]ces?.{0,30}(sucr[ée]es?)")
     return {"total": total or 0, "sale": sale or 0, "sucre": sucre or 0}
+
+
+def summarize_short(items: List[str], max_tokens: int = 12) -> str:
+    s = " ".join(items)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return "—"
+    toks = s.split()
+    if len(toks) <= max_tokens:
+        return s
+    return " ".join(toks[:max_tokens]) + "…"
 
 
 def make_summary_catering_post(post: str, items: List[str]) -> str:
     if not items:
         return "—"
 
-    # Cocktail: summarise pieces
     if post == "Cocktail":
         counts = extract_piece_counts(items)
         bits = []
@@ -492,32 +567,29 @@ def make_summary_catering_post(post: str, items: List[str]) -> str:
                 sub.append(f"{counts['sale']} salées")
             if counts["sucre"] > 0:
                 sub.append(f"{counts['sucre']} sucrées")
-            if sub:
-                bits.append(" + ".join(sub))
-        # detect "en option" on sucré
+            bits.append(" + ".join(sub))
         opt_sucre = any("sucr" in fold(x) and "option" in fold(x) for x in items)
         if opt_sucre:
-            bits.append("(sucré en option possible)")
+            bits.append("(sucré en option)")
         return " — ".join(bits) if bits else "Cocktail (voir détail)"
 
-    # Pauses: look for "gourmandises", "mignardises", "2 ... par personne"
     if post in ["Pause matin", "Pause après-midi"]:
-        joined = " ".join(items)
-        lj = fold(joined)
+        lj = fold(" ".join(items))
         m = re.search(r"\b(\d{1,2})\s+(gourmandis|mignardi|pi[eè]ces?)\w*\s+par\s+personne\b", lj)
         if m:
             n = m.group(1)
-            # try to name examples
-            examples = []
-            for ex in ["financier", "cannel", "cookie", "brownie", "madeleine", "mignard"]:
-                if ex in lj:
-                    examples.append(ex)
-            ex_txt = f" ({', '.join(examples[:3])})" if examples else ""
+            ex = []
+            for e in ["financier", "cannel", "cookie", "brownie", "madeleine", "mignard"]:
+                if e in lj:
+                    ex.append(e)
+            ex_txt = f" ({', '.join(ex[:3])})" if ex else ""
             return f"{n} gourmandises/pers{ex_txt}"
-        # fallback short
-        return summarize_short(items, max_tokens=12)
+        # fallback for “10 financiers”
+        m2 = re.search(r"\b(\d{1,3})\s+financiers\b", lj)
+        if m2:
+            return f"{m2.group(1)} financiers"
+        return summarize_short(items, 10)
 
-    # Accueil café: compress to "café + thé + jus"
     if post == "Accueil café":
         lj = fold(" ".join(items))
         flags = []
@@ -529,11 +601,8 @@ def make_summary_catering_post(post: str, items: List[str]) -> str:
             flags.append("jus")
         if "soft" in lj:
             flags.append("softs")
-        if flags:
-            return " + ".join(dict.fromkeys(flags))
-        return summarize_short(items, max_tokens=12)
+        return " + ".join(dict.fromkeys(flags)) if flags else summarize_short(items, 10)
 
-    # Déjeuner: compress to "buffet / wrap / plat + dessert"
     if post == "Déjeuner":
         lj = fold(" ".join(items))
         tags = []
@@ -545,11 +614,8 @@ def make_summary_catering_post(post: str, items: List[str]) -> str:
             tags.append("salade")
         if "dessert" in lj or "tarte" in lj or "entremet" in lj:
             tags.append("dessert")
-        if tags:
-            return " + ".join(dict.fromkeys(tags))
-        return summarize_short(items, max_tokens=12)
+        return " + ".join(dict.fromkeys(tags)) if tags else summarize_short(items, 10)
 
-    # Boissons: compress
     if post == "Boissons (global)":
         lj = fold(" ".join(items))
         tags = []
@@ -558,53 +624,49 @@ def make_summary_catering_post(post: str, items: List[str]) -> str:
         if "vin" in lj:
             tags.append("vin")
         if "champagne" in lj:
-            if "option" in lj:
-                tags.append("champagne (option)")
-            else:
-                tags.append("champagne")
-        if tags:
-            return " + ".join(dict.fromkeys(tags))
-        return summarize_short(items, max_tokens=12)
+            tags.append("champagne (option)" if "option" in lj else "champagne")
+        return " + ".join(dict.fromkeys(tags)) if tags else summarize_short(items, 10)
 
-    # Options/logistique: short
-    if post in ["Options", "Autres (logistique)"]:
-        return summarize_short(items, max_tokens=10)
-
-    return summarize_short(items, max_tokens=12)
-
-
-def summarize_short(items: List[str], max_tokens: int = 12) -> str:
-    # pick 1-2 lines max
-    s = " ".join(items)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
+    # IMPORTANT: Options + Logistique = pas de pavé
+    if post == "Options":
+        lj = fold(" ".join(items))
+        # ne garder que des options "concrètes"
+        keep = []
+        for it in items:
+            li = fold(it)
+            if "décoration" in li or "decoration" in li or "florale" in li or "suppl" in li or "option" in li:
+                keep.append(it)
+        if keep:
+            return summarize_short(keep, 10)
         return "—"
-    tokens = s.split()
-    if len(tokens) <= max_tokens:
-        return s
-    return " ".join(tokens[:max_tokens]) + "…"
+
+    if post == "Autres (logistique)":
+        lj = fold(" ".join(items))
+        tags = []
+        if "livraison" in lj or "reprise" in lj:
+            tags.append("livraison/reprise")
+        if "personnel" in lj or "service" in lj:
+            tags.append("personnel")
+        if "vaisselle" in lj or "verrerie" in lj or "flûte" in lj or "assiette" in lj:
+            tags.append("vaisselle/verrerie")
+        if "mobilier" in lj or "mange" in lj:
+            tags.append("mobilier")
+        return " + ".join(dict.fromkeys(tags)) if tags else "Voir détail"
+
+    return summarize_short(items, 10)
 
 
 def make_summary_tech_post(post: str, items: List[str]) -> str:
     if not items:
         return "—"
-    # tech summary: keep short labels
     if post == "Équipe":
-        # list unique roles
         lj = fold(" ".join(items))
         roles = []
         for r in ["réalisateur", "cadreur", "ingénieur du son", "ingenieur du son", "technicien"]:
             if r in lj:
-                roles.append(r.replace("ingenieur", "ingénieur"))
-        if roles:
-            # title case-ish
-            roles2 = []
-            for r in roles:
-                roles2.append(r.title())
-            return " + ".join(dict.fromkeys(roles2))
-    if post in ["Captation", "Régie", "Diffusion", "Replay"]:
-        return summarize_short(items, max_tokens=12)
-    return summarize_short(items, max_tokens=14)
+                roles.append(r.replace("ingenieur", "ingénieur").title())
+        return " + ".join(dict.fromkeys(roles)) if roles else summarize_short(items, 10)
+    return summarize_short(items, 12)
 
 
 # =========================
@@ -630,21 +692,26 @@ class TechOffer:
 
 def parse_catering_offer(text: str, filename: str) -> CateringOffer:
     vendor = guess_vendor_name(text, filename)
+    if vendor_is_suspicious(vendor):
+        vendor = vendor_from_filename(filename)
+
     total_ttc = find_total_ttc(text)
 
     lines = cut_at_cgv(split_lines(text))
-    # keep admin lines separately (never displayed in detail)
     content = [ln for ln in lines if not is_noise_line(ln)]
-    items = extract_items(content, MENU_HINTS, max_len=280, relax=True)
+
+    # keep tabular labels (left side) + bullets + relax a bit
+    raw_items = extract_items(content, MENU_HINTS, max_len=300, relax=True, tabular_labels=True)
 
     posts_detail = {p: [] for p in CATERING_POSTS}
-    for it in items:
+    for it in raw_items:
+        if not should_keep_catering_detail(it):
+            continue
         posts_detail[route_catering_item(it)].append(it)
 
     # dedup
     for p in posts_detail:
-        seen = set()
-        out = []
+        seen, out = set(), []
         for it in posts_detail[p]:
             k = fold(it)
             if k in seen:
@@ -660,20 +727,25 @@ def parse_catering_offer(text: str, filename: str) -> CateringOffer:
 
 def parse_tech_offer(text: str, filename: str) -> TechOffer:
     vendor = guess_vendor_name(text, filename)
+    if vendor_is_suspicious(vendor):
+        vendor = vendor_from_filename(filename)
+
     total_ttc = find_total_ttc(text)
 
     lines = cut_at_cgv(split_lines(text))
     content = [ln for ln in lines if not is_noise_line(ln)]
-    items = extract_items(content, TECH_HINTS, max_len=360, relax=False)
+
+    raw_items = extract_items(content, TECH_HINTS, max_len=380, relax=False, tabular_labels=True)
 
     posts_detail = {p: [] for p in TECH_POSTS}
-    for it in items:
+    for it in raw_items:
+        if not should_keep_tech_detail(it):
+            continue
         posts_detail[route_tech_item(it)].append(it)
 
     # dedup
     for p in posts_detail:
-        seen = set()
-        out = []
+        seen, out = set(), []
         for it in posts_detail[p]:
             k = fold(it)
             if k in seen:
@@ -799,7 +871,7 @@ def build_word(event_title: str, event_date: str, guests: int,
     add_small(doc, f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     doc.add_paragraph("")
 
-    # 1) Traiteur synthèse (SUMMARY ONLY)
+    # Traiteur: SUMMARY ONLY
     if catering:
         add_subtitle(doc, "1) PRESTATION TRAITEUR — Comparatif (synthèse)")
         vendors = catering[:3]
@@ -843,7 +915,7 @@ def build_word(event_title: str, event_date: str, guests: int,
 
         doc.add_paragraph("")
 
-    # 2) Technique synthèse (SUMMARY ONLY)
+    # Technique: SUMMARY ONLY
     if tech:
         add_subtitle(doc, "2) PRESTATION TECHNIQUE — Synthèse")
         for idx, off in enumerate(tech[:2], start=1):
@@ -878,7 +950,7 @@ def build_word(event_title: str, event_date: str, guests: int,
                         set_run(rrr, bold=False, size=9, color="#111827")
             doc.add_paragraph("")
 
-    # 3) DETAILS (full lists)
+    # DETAILS
     doc.add_page_break()
     add_title(doc, "DÉTAIL DES OFFRES (modifiable via l’outil)")
     add_small(doc, "Le comparatif ci-dessus est une synthèse ; ci-dessous la liste des contenus.")
@@ -934,10 +1006,9 @@ header[data-testid="stHeader"] {{ display: none; }}
 )
 
 st.markdown(f"## {APP_TITLE}")
-st.caption("Comparatif = résumé. Détail = listes complètes. Tu peux corriger les deux avant export Word.")
+st.caption("Comparatif = résumé. Détail = listes complètes. (Le bruit admin/adresses est filtré.)")
 st.divider()
 
-debug_mode = st.checkbox("Mode debug", value=False)
 ttc_min = st.number_input("Seuil TTC minimum (alerte) — pas bloquant", min_value=0, max_value=200000, value=500, step=50)
 
 c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="center")
@@ -973,12 +1044,8 @@ with st.spinner("Lecture des PDFs…"):
         txt = extract_pdf_text(f)
         tech_offers.append(parse_tech_offer(txt, f.name))
 
-if debug_mode:
-    st.write("DEBUG vendors:", [c.vendor for c in catering_offers], [t.vendor for t in tech_offers])
-
 tabA, tabB, tabC = st.tabs(["Traiteur — Synthèse", "Traiteur — Détail", "Technique"])
 
-# -------- TRAITEUR: SYNTHÈSE editable --------
 with tabA:
     if not catering_offers:
         st.caption("Aucun devis traiteur.")
@@ -987,14 +1054,14 @@ with tabA:
             with st.expander(f"Traiteur {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"c_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire suspect (adresse/en-tête). Corrige-le.")
+                    st.warning("Nom prestataire suspect. (Astuce: mets juste 'LE CERCLE' / 'LL CONCEPT' etc.)")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"c_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)
                 if off.total_ttc is not None and off.total_ttc < float(ttc_min):
-                    st.warning(f"TTC < {ttc_min}€ : probable mauvaise détection (à vérifier).")
+                    st.warning(f"TTC < {ttc_min}€ : probable mauvaise détection.")
 
-                st.markdown("**Synthèse par poste (ce qui alimente le 1er tableau)**")
+                st.markdown("**Synthèse par poste (alimentation du 1er tableau)**")
                 for post in CATERING_POSTS:
                     off.posts_summary[post] = st.text_input(
                         f"{post} — Synthèse",
@@ -1003,7 +1070,6 @@ with tabA:
                     )
                 off.comment = st.text_area("Commentaire", value=off.comment, height=80, key=f"c_comment_{i}")
 
-# -------- TRAITEUR: DÉTAIL editable --------
 with tabB:
     if not catering_offers:
         st.caption("Aucun devis traiteur.")
@@ -1020,7 +1086,6 @@ with tabB:
                     )
                     off.posts_detail[post] = [norm(x) for x in edited.splitlines() if norm(x)]
 
-# -------- TECHNIQUE editable --------
 with tabC:
     if not tech_offers:
         st.caption("Aucun devis technique.")
@@ -1029,12 +1094,12 @@ with tabC:
             with st.expander(f"Technique {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"t_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire suspect. Corrige-le.")
+                    st.warning("Nom prestataire suspect.")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"t_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)
 
-                st.markdown("**Synthèse technique (utilisée dans la synthèse)**")
+                st.markdown("**Synthèse technique**")
                 for post in TECH_POSTS:
                     off.posts_summary[post] = st.text_input(
                         f"{post} — Synthèse",

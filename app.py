@@ -1,20 +1,18 @@
-# app.py — Synthèse devis prestataires (robuste + simple)
-# ------------------------------------------------------
-# UX: pré-rempli automatiquement -> tu corriges si besoin -> export toujours possible
-# Objectif: mieux capter les bonnes infos au bon endroit (traiteur + technique)
+# app.py — Synthèse devis prestataires (v2 "robuste tabulaire")
+# ------------------------------------------------------------
+# Objectif: extraction fiable traiteur + technique sur PDFs réels:
+# - PDF tabulaires (désignation/qté/PU/HT/TVA/TTC)
+# - PDF "marketing" avec déroulé / pages de texte
+# - CGV / IBAN / adresses / signatures -> filtrés
 #
-# Stratégie:
-# - Nettoyage agressif du bruit (CGV, IBAN, tableaux prix, TVA, adresses, déroulé horaire)
-# - Extraction par SECTIONS (titres) + fallback par mots-clés
-# - Vendor: heuristique + garde-fous pour éviter “Le personnel de service / Récapitulatif / Scénographie…”
-# - Technique: extraction dédiée (TECH_KEEP_HINTS) + filtrage “TVA / Total TVA”
-#
-# Tested mentally on scenarios:
-# 1) PDF marketing traiteur (photos + texte) -> garde titres + listes, supprime boilerplate Institut Imagine/étage/horaires
-# 2) PDF devis tabulaire -> supprime lignes chiffrées, garde quelques lignes descriptives + listes d’items
-# 3) PDF technique tabulaire -> garde caméras/régie/zoom/replay/équipe, supprime TVA/base/IBAN
-# 4) CGV longues -> filtrées via mots-clés génériques (client/vendeur/invités/tribunal/etc.)
-# ------------------------------------------------------
+# Points clés:
+# 1) Vendor: priorise ligne avant SIRET/RCS + garde-fous anti-déroulé/titres
+# 2) TTC: collecte toutes occurrences -> prend la dernière "finale"
+# 3) Sections: header detection stricte (évite faux headers)
+# 4) Items: conserve bullets + extrait libellé depuis lignes tabulaires
+# 5) Placeholders / déroulé: filtrage dédié
+# 6) "Relax menu": garde lignes menu même sans hints dans sections pertinentes
+# ------------------------------------------------------------
 
 import io
 import re
@@ -63,9 +61,8 @@ TECH_POSTS = [
     "Conseil",
 ]
 
-
 # =========================
-# LEXICON (générique)
+# LEXICON
 # =========================
 MENU_KEEP_HINTS = [
     "accueil", "petit", "déjeuner", "dejeuner", "pause", "buffet", "cocktail", "apéritif", "aperitif",
@@ -87,41 +84,45 @@ TECH_KEEP_HINTS = [
     "micro", "audio",
 ]
 
-# Vendor forbidden tokens (avoid choosing a section title or recap title)
 VENDOR_FORBIDDEN = [
     "accueil", "pause", "déjeuner", "dejeuner", "buffet", "cocktail", "boissons", "options",
     "personnel", "service", "scénographie", "scenographie",
     "récapitulatif", "recapitulatif", "sur la base", "hors options", "budget", "déroulé", "deroule",
-    "détail", "detail", "proposition",
+    "détail", "detail", "proposition", "prestation", "inclus", "option",
 ]
 
-# Noise tokens (legal/admin/tables)
+# anti “vendor fantôme” (déroulé / planning)
+VENDOR_HARD_FORBIDDEN = [
+    "déroulé", "deroule", "rangement", "départ", "depart", "fin de la prestation",
+    "reprise", "arrivée", "arrivee", "livraison", "horaire", "planning",
+    "installation", "désinstallation", "desinstallation",
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+]
+
 NOISE_HINTS = [
     # legal/admin/payment
-    "conditions générales", "cgv", "rgpd", "données personnelles", "donnees personnelles",
+    "conditions générales", "conditions generales", "cgv", "rgpd", "données personnelles", "donnees personnelles",
     "propriété intellectuelle", "propriete intellectuelle", "droit à l'image", "droit a l'image",
     "siret", "rcs", "iban", "bic", "rib", "banque", "capital", "tva intracommunautaire",
     "pénalité", "penalite", "recouvrement", "mise en demeure", "tribunal",
     "responsabilité", "responsabilite", "dommages", "intérêts", "interets",
-    "déchéance", "decheance", "résolutoire", "resolutoire", "litige", "contestation", "dédommagement", "dedommagement",
+    "déchéance", "decheance", "résolutoire", "resolutoire", "litige", "contestation",
     "adresse", "tél", "tel", "email", "e-mail", "www.", "site internet",
     "référence", "reference", "devis n", "date de devis", "date de validité", "signature",
     "mode de paiement", "facture",
     "net a payer", "net à payer",
-    # tables / totals (we keep total TTC via regex elsewhere, but drop lines in bodies)
-    "désignation", "quantité", "p.u", "pu ht", "montant", "remise", "taux", "qté", "réf", "ref",
+    # tables / totals
+    "désignation", "designation", "quantité", "quantite", "p.u", "pu ht", "montant", "remise", "taux", "qté", "qte", "réf", "ref",
     "base ht", "total ht", "total tva", "tva :", "tva", "page ",
-    # cancellation boilerplate
-    "à moins de 24h", "a moins de 24h", "à moins de 48h", "a moins de 48h", "annulée", "annulee",
-    # CGV “invités/convives” noise
-    "le client", "le vendeur", "le preneur",
-    "invité", "invites", "convive", "convives",
-    "annulation de la commande", "augmentation du nombre", "diminution du nombre",
-    "se dégage", "se degage", "sans que", "dans les délais", "dans les delais",
-    "à la charge", "a la charge",
     # déroulé / planning
-    "déroulé", "deroule", "livraisons et mise en place", "débarrassage", "debarrassage",
+    "livraisons et mise en place", "débarrassage", "debarrassage",
+    # client/vendeur CGV noise
+    "le client", "le vendeur", "le preneur",
+    "annulation de la commande", "augmentation du nombre", "diminution du nombre",
+    "sans que", "dans les délais", "dans les delais",
 ]
+
+ADDRESS_HINTS = ["rue", "avenue", "boulevard", "allée", "allee", "bp", "cedex", "france", "paris", "lyon", "marseille"]
 
 
 # =========================
@@ -150,9 +151,9 @@ def extract_pdf_text(uploaded_file) -> str:
 
 
 def split_lines(text: str) -> List[str]:
-    # improve segmentation
     text = text.replace("•", "\n• ")
     text = text.replace(":-", ": -")
+    # espace après : ; si collés
     text = re.sub(r"([:;])([A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 \2", text)
     raw = text.splitlines()
     out = []
@@ -164,17 +165,37 @@ def split_lines(text: str) -> List[str]:
     return out
 
 
+def looks_like_schedule_line(s: str) -> bool:
+    l = fold(s)
+    # "06h00 à 08h30 ..." / "10h25-10h45 ..."
+    if re.search(r"\b0?\d{1,2}h\d{2}\b", l) and ((" à " in l) or (" a " in l) or ("-" in l)):
+        return len(l) <= 160
+    return False
+
+
 def looks_like_price_table_line(s: str) -> bool:
+    """
+    Détecte ligne "majoritairement chiffres/prix".
+    Attention: on ne veut PAS jeter les lignes tabulaires utiles (Cadreur, Réalisateur...),
+    donc on ne se sert pas de ça pour supprimer aveuglément ; on l'utilise surtout pour
+    décider de "libellé à extraire".
+    """
     core = re.sub(r"[€]", "", norm(s))
-    if re.fullmatch(r"[\d\s,\.%]+", core) and sum(ch.isdigit() for ch in core) >= 6:
+    digits = sum(ch.isdigit() for ch in core)
+    letters = sum(ch.isalpha() for ch in core)
+    if digits >= 10 and digits > letters:
+        return True
+    if re.fullmatch(r"[\d\s,\.%\-\/]+", core) and digits >= 6:
         return True
     return False
 
 
-def looks_like_schedule_line(s: str) -> bool:
-    # examples: "06h00 à 08h30 Livraisons...", "10h25 à 10h45 Pause-café"
-    l = fold(s)
-    if re.search(r"\b0?\d{1,2}h\d{2}\b", l) and (" à " in l or " a " in l) and len(l) <= 140:
+def looks_like_placeholder_line(s: str) -> bool:
+    # ex ": Nombre de plateaux : Pax" / ": CONTACT : ..."
+    ss = norm(s)
+    if re.match(r"^\s*:\s*[A-Za-zÀ-ÖØ-öø-ÿ].{0,80}:\s*", ss):
+        return True
+    if re.search(r"\b(pax|nb pax|nombre de pax)\b", fold(ss)) and ss.strip().startswith(":"):
         return True
     return False
 
@@ -185,20 +206,29 @@ def is_noise_line(s: str) -> bool:
         return True
     l = fold(s)
 
-    if re.fullmatch(r"\d{1,3}", s):
+    if looks_like_placeholder_line(s):
         return True
-    if looks_like_price_table_line(s):
+
+    # numéros seuls
+    if re.fullmatch(r"\d{1,4}", s):
         return True
+
+    # lignes planning / horaires (pas utiles dans la synthèse)
     if looks_like_schedule_line(s):
         return True
+
+    # boilerplate juridique/admin
     if any(k in l for k in NOISE_HINTS):
         return True
-    # marketing boilerplate
+
+    # marketing "Institut Imagine ..."
     if "institut imagine" in l and ("étage" in l or "etage" in l or "sur la base" in l):
         return True
+
     # time-only
-    if (re.search(r"\b\d{1,2}h\d{0,2}\b", l) or re.search(r"\bde\s+\d{1,2}h\d{0,2}\b", l)) and len(l) <= 45:
+    if re.fullmatch(r"(de\s+)?\d{1,2}h(\d{2})?", l):
         return True
+
     return False
 
 
@@ -234,6 +264,7 @@ def euro_fmt(x: Optional[float]) -> str:
 
 
 def find_total_ttc(text: str) -> Optional[float]:
+    # collecte toutes occurrences, on prend la dernière (souvent la plus "finale")
     patterns = [
         r"total\s+ttc\s*[:\-]?\s*([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
         r"net\s+a\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
@@ -241,88 +272,41 @@ def find_total_ttc(text: str) -> Optional[float]:
         r"total\s+à\s+payer.*?([0-9][0-9 \u00A0]*[,\.][0-9]{2})",
     ]
     lt = fold(text)
+    found: List[float] = []
     for pat in patterns:
-        m = re.search(pat, lt, flags=re.IGNORECASE | re.DOTALL)
-        if m:
+        for m in re.finditer(pat, lt, flags=re.IGNORECASE | re.DOTALL):
             amt = parse_eur_amount(m.group(1))
             if amt is not None:
-                return amt
-    return None
-
-
-def looks_like_section_title(s: str) -> bool:
-    l = fold(s)
-    return any(k in l for k in VENDOR_FORBIDDEN)
-
-
-def vendor_is_suspicious(v: str) -> bool:
-    v = norm(v)
-    if len(v) < 3:
-        return True
-    lv = fold(v)
-    if "@" in v or "contact" in lv:
-        return True
-    if looks_like_section_title(v):
-        return True
-    return False
-
-
-def guess_vendor_name(text: str, filename: str) -> str:
-    lines = [norm(x) for x in text.splitlines() if norm(x)]
-    bad = re.compile(r"\b(devis|facture|date|total|tva|siret|iban|bic|net a payer|net à payer|contact)\b", re.I)
-
-    def penalty(ln: str) -> int:
-        l = fold(ln)
-        p = 0
-        if "contact" in l:
-            p += 12
-        if "@" in ln:
-            p += 14
-        if re.search(r"\b0[1-9](\s?\d{2}){4}\b", ln):
-            p += 14
-        if looks_like_section_title(ln):
-            p += 20
-        if any(k in l for k in ["rue", "avenue", "boulevard", "france", "paris"]):
-            p += 6
-        return p
-
-    candidates = []
-    for ln in lines[:280]:
-        if len(ln) < 4 or len(ln) > 70:
-            continue
-        if bad.search(ln):
-            continue
-        if is_noise_line(ln):
-            continue
-        if looks_like_section_title(ln):
-            continue
-        alpha = sum(ch.isalpha() for ch in ln)
-        if alpha < 6:
-            continue
-        if (ln.upper() == ln) or (alpha / max(len(ln), 1) > 0.55):
-            candidates.append(ln)
-
-    if candidates:
-        prefer = ["réceptions", "receptions", "traiteur", "production", "sas", "sarl"]
-        best, best_score = None, -10**9
-        for c in candidates:
-            sc = -penalty(c)
-            fc = fold(c)
-            for k in prefer:
-                if k in fc:
-                    sc += 6
-            if sc > best_score:
-                best_score = sc
-                best = c
-        if best:
-            return best
-
-    return filename.rsplit(".", 1)[0]
+                found.append(amt)
+    return found[-1] if found else None
 
 
 # =========================
-# SECTION EXTRACTION
+# HEADER / SECTION LOGIC
 # =========================
+def looks_like_header_line(s: str) -> bool:
+    s = norm(s)
+    if not s:
+        return False
+    if len(s) > 90:
+        return False
+    if s.endswith("."):
+        return False
+    if s.startswith(("•", "-", "–")):
+        return False
+
+    alpha = sum(ch.isalpha() for ch in s)
+    if alpha < 4:
+        return False
+
+    upper_ratio = sum(ch.isupper() for ch in s if ch.isalpha()) / max(1, alpha)
+    has_colon = s.endswith(":") or bool(re.search(r"\s:\s?$", s))
+    numbered = bool(re.match(r"^\s*(\d+[\.\)]|[A-Z][\.\)])\s+", s))  # "1." / "A)" etc.
+    is_short = len(s) <= 45
+
+    return (has_colon and is_short) or (upper_ratio >= 0.70 and alpha >= 6) or (numbered and len(s) <= 70)
+
+
 def is_section_header(line: str) -> bool:
     l = fold(line)
     keys = [
@@ -346,23 +330,19 @@ def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
     current: List[str] = []
 
     for ln in lines:
-        if re.fullmatch(r"(RÉF|REF|QTÉ|QTE|PU|PU HT|MONTANT|TVA|TAUX|BASE HT)\b.*", ln, flags=re.I):
-            current.append(ln)
-            continue
-
-        if is_section_header(ln) and len(ln) <= 110 and not ln.startswith(("•", "-", "–")):
+        # Header strict: doit être "section-like" + "header-like"
+        if is_section_header(ln) and looks_like_header_line(ln):
             if current:
                 sections.append((current_title, current))
-            current_title = ln
+            current_title = ln.rstrip(":").strip()
             current = []
             continue
-
         current.append(ln)
 
     if current:
         sections.append((current_title, current))
 
-    cleaned = []
+    cleaned: List[Tuple[str, List[str]]] = []
     for title, body in sections:
         body2 = [x for x in body if not is_noise_line(x)]
         if body2:
@@ -370,23 +350,105 @@ def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
     return cleaned
 
 
-def extract_items(body: List[str], keep_hints: List[str], max_len: int) -> List[str]:
+# =========================
+# TABULAR LINE -> LABEL EXTRACTION
+# =========================
+def extract_left_label_from_tabular(line: str) -> Optional[str]:
+    """
+    Essaie de récupérer le "libellé" d'une ligne tabulaire:
+    "Cadreur 1,00 j 600,00 ... " -> "Cadreur"
+    "Ingénieur du son 1 forfait 450,00 ..." -> "Ingénieur du son"
+    """
+    s = norm(line)
+    if len(s) < 6:
+        return None
+    if looks_like_placeholder_line(s):
+        return None
+    # coupe dès qu'on voit un bloc quantité/prix
+    # heuristique: premier token contenant un chiffre -> on garde tout avant
+    parts = s.split()
+    cut = None
+    for i, tok in enumerate(parts):
+        if any(ch.isdigit() for ch in tok):
+            cut = i
+            break
+    if cut is None or cut == 0:
+        return None
+
+    left = " ".join(parts[:cut]).strip(" -–:;")
+    if len(left) < 4:
+        return None
+
+    ll = fold(left)
+    # évite adresses/titres
+    if any(k in ll for k in ADDRESS_HINTS):
+        return None
+    if any(k in ll for k in ["total", "tva", "montant", "remise", "désignation", "designation", "quantité", "quantite", "page"]):
+        return None
+    if looks_like_header_line(left) and not is_section_header(left):
+        # un gros titre en CAPS -> pas un item
+        return None
+    return left
+
+
+def looks_like_menu_item_line(s: str) -> bool:
+    s = norm(s)
+    l = fold(s)
+
+    if len(s) < 4 or len(s) > 180:
+        return False
+    if looks_like_price_table_line(s):
+        # tabulaire menu: on peut récupérer le libellé (ex: "Viennoiseries 100 2,50 ...")
+        lab = extract_left_label_from_tabular(s)
+        return bool(lab)
+
+    if any(k in l for k in ["total", "tva", "iban", "siret", "cgv", "référence", "reference"]):
+        return False
+
+    if re.search(r"\b(g|gr|kg|ml|cl|l)\b", l):
+        return True
+    if re.search(r"\b(filet|tarte|salade|quiche|risotto|fromage|dessert|mignard|verrine|canapé|canape)\b", l):
+        return True
+
+    words = [w for w in re.split(r"\s+", s) if w]
+    if 2 <= len(words) <= 10 and sum(w[:1].isupper() for w in words if w[:1].isalpha()) >= 2:
+        return True
+    return False
+
+
+def extract_items(body: List[str], keep_hints: List[str], max_len: int, relax: bool = False) -> List[str]:
     items: List[str] = []
+
     for ln in body:
         s = norm(ln)
         if not s or is_noise_line(s):
             continue
 
+        # bullets
         if s.startswith(("•", "-", "–")):
             it = s.lstrip("•-– ").strip()
             if it and not is_noise_line(it):
                 items.append(unglue(it))
             continue
 
-        l = fold(s)
-        if len(s) <= max_len and any(k in l for k in keep_hints) and not looks_like_price_table_line(s):
-            items.append(unglue(s))
+        # tabular line: try keep left label
+        if looks_like_price_table_line(s):
+            lab = extract_left_label_from_tabular(s)
+            if lab:
+                items.append(unglue(lab))
+            continue
 
+        # normal line
+        l = fold(s)
+        if len(s) <= max_len:
+            if any(k in l for k in keep_hints):
+                items.append(unglue(s))
+                continue
+            if relax and looks_like_menu_item_line(s):
+                items.append(unglue(s))
+                continue
+
+    # de-dup
     out, seen = [], set()
     for it in items:
         k = fold(it)
@@ -397,6 +459,9 @@ def extract_items(body: List[str], keep_hints: List[str], max_len: int) -> List[
     return out
 
 
+# =========================
+# CLASSIFICATION
+# =========================
 def classify_catering_section(title: str) -> str:
     l = fold(title)
     if "accueil" in l or "petit" in l:
@@ -448,6 +513,93 @@ def classify_tech_section(title: str) -> str:
 
 
 # =========================
+# VENDOR
+# =========================
+def looks_like_section_title(s: str) -> bool:
+    l = fold(s)
+    return any(k in l for k in VENDOR_FORBIDDEN)
+
+
+def vendor_is_suspicious(v: str) -> bool:
+    v = norm(v)
+    if len(v) < 3:
+        return True
+    lv = fold(v)
+    if any(k in lv for k in VENDOR_HARD_FORBIDDEN):
+        return True
+    if v.strip().startswith(":"):
+        return True
+    if "@" in v or "contact" in lv:
+        return True
+    if looks_like_section_title(v):
+        return True
+    # évite adresse pure
+    if sum(k in lv for k in ADDRESS_HINTS) >= 2:
+        return True
+    return False
+
+
+def guess_vendor_name(text: str, filename: str) -> str:
+    lines = [norm(x) for x in text.splitlines() if norm(x)]
+
+    # 1) heuristique forte: ligne au-dessus de SIRET/RCS
+    for idx, ln in enumerate(lines[:160]):
+        l = fold(ln)
+        if "siret" in l or "rcs" in l:
+            for back in range(1, 5):
+                j = idx - back
+                if j >= 0:
+                    cand = lines[j].strip()
+                    if cand and not is_noise_line(cand) and not vendor_is_suspicious(cand):
+                        if not re.search(r"\b(devis|facture|proposition|référence|reference)\b", fold(cand)):
+                            return cand
+            break
+
+    # 2) fallback: candidates "nom société" (caps-ish / alpha) dans le haut du doc
+    bad = re.compile(r"\b(devis|facture|date|total|tva|iban|bic|net a payer|net à payer|contact)\b", re.I)
+    candidates = []
+    for ln in lines[:260]:
+        if len(ln) < 4 or len(ln) > 70:
+            continue
+        if bad.search(ln):
+            continue
+        if is_noise_line(ln):
+            continue
+        if vendor_is_suspicious(ln):
+            continue
+        alpha = sum(ch.isalpha() for ch in ln)
+        if alpha < 6:
+            continue
+        upper_ratio = sum(ch.isupper() for ch in ln if ch.isalpha()) / max(1, alpha)
+        if ln.upper() == ln or upper_ratio > 0.60:
+            candidates.append(ln)
+
+    if candidates:
+        prefer = ["réceptions", "receptions", "traiteur", "production", "sas", "sarl", "unik", "concept", "cercle", "cadet"]
+        best, best_score = None, -10**9
+        for c in candidates:
+            score = 0
+            fc = fold(c)
+            for k in prefer:
+                if k in fc:
+                    score += 6
+            # pénalités
+            if any(k in fc for k in ADDRESS_HINTS):
+                score -= 6
+            if re.search(r"\b0[1-9](\s?\d{2}){4}\b", c):
+                score -= 12
+            if looks_like_header_line(c) and not re.search(r"\b(sas|sarl|sa|groupe|concept|unik)\b", fc):
+                score -= 8
+            if score > best_score:
+                best_score, best = score, c
+        if best and not vendor_is_suspicious(best):
+            return best
+
+    # 3) fallback filename
+    return filename.rsplit(".", 1)[0]
+
+
+# =========================
 # MODEL
 # =========================
 @dataclass
@@ -466,7 +618,7 @@ class TechOffer:
     comment: str
 
 
-def parse_catering_offer(text: str, filename: str) -> CateringOffer:
+def parse_catering_offer(text: str, filename: str) -> Tuple[CateringOffer, Dict]:
     vendor = guess_vendor_name(text, filename)
     total_ttc = find_total_ttc(text)
 
@@ -478,18 +630,19 @@ def parse_catering_offer(text: str, filename: str) -> CateringOffer:
 
     for title, body in sections:
         post = classify_catering_section(title)
-        items = extract_items(body, MENU_KEEP_HINTS, max_len=240)
+        relax = post in ["Accueil café", "Pause matin", "Déjeuner", "Pause après-midi", "Cocktail"]
+        items = extract_items(body, MENU_KEEP_HINTS, max_len=260, relax=relax)
 
         for it in items:
-            if "en option" in fold(it) or fold(it).startswith("option"):
+            li = fold(it)
+            if "en option" in li or li.startswith("option"):
                 posts["Options"].append(it)
             else:
                 posts[post].append(it)
 
-    # fallback: if a key post is empty, scan whole document for bullets with hints
-    if not posts["Déjeuner"] or not posts["Cocktail"]:
-        all_items = extract_items(filtered, MENU_KEEP_HINTS, max_len=220)
-        # heuristic split
+    # fallback global si trop vide
+    if sum(len(v) for v in posts.values()) < 6:
+        all_items = extract_items(filtered, MENU_KEEP_HINTS, max_len=240, relax=True)
         for it in all_items:
             li = fold(it)
             if "déjeunatoire" in li:
@@ -498,6 +651,10 @@ def parse_catering_offer(text: str, filename: str) -> CateringOffer:
                 posts["Cocktail"].append(it)
             elif "déjeuner" in li or "dejeuner" in li or "buffet" in li:
                 posts["Déjeuner"].append(it)
+            elif "pause" in li:
+                posts["Pause matin"].append(it)
+            elif "café" in li or "cafe" in li or "thé" in li or "the" in li:
+                posts["Accueil café"].append(it)
 
     # de-dup
     for p in posts:
@@ -510,10 +667,15 @@ def parse_catering_offer(text: str, filename: str) -> CateringOffer:
             out.append(it)
         posts[p] = out
 
-    return CateringOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment="")
+    debug = {
+        "vendor": vendor,
+        "total_ttc": total_ttc,
+        "sections": [(t, len(b)) for t, b in sections[:30]],
+    }
+    return CateringOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment=""), debug
 
 
-def parse_tech_offer(text: str, filename: str) -> TechOffer:
+def parse_tech_offer(text: str, filename: str) -> Tuple[TechOffer, Dict]:
     vendor = guess_vendor_name(text, filename)
     total_ttc = find_total_ttc(text)
 
@@ -525,23 +687,23 @@ def parse_tech_offer(text: str, filename: str) -> TechOffer:
 
     for title, body in sections:
         post = classify_tech_section(title)
-        items = extract_items(body, TECH_KEEP_HINTS, max_len=340)
+        items = extract_items(body, TECH_KEEP_HINTS, max_len=340, relax=False)
         posts[post].extend(items)
 
-    # global fallback for technique: scan whole doc for TECH hints and dispatch
-    if sum(len(v) for v in posts.values()) < 8:
-        all_items = extract_items(filtered, TECH_KEEP_HINTS, max_len=340)
+    # fallback global si trop pauvre
+    if sum(len(v) for v in posts.values()) < 6:
+        all_items = extract_items(filtered, TECH_KEEP_HINTS, max_len=340, relax=False)
         for it in all_items:
             li = fold(it)
             if "replay" in li or "wetransfer" in li or "we transfer" in li:
                 posts["Replay"].append(it)
             elif "zoom" in li or "live" in li or "diffusion" in li or "duplex" in li:
                 posts["Diffusion"].append(it)
-            elif "régie" in li or "regie" in li or "écran" in li or "ecran" in li:
+            elif "régie" in li or "regie" in li or "écran" in li or "ecran" in li or "tv" in li:
                 posts["Régie"].append(it)
             elif "caméra" in li or "camera" in li or "captation" in li or "4k" in li:
                 posts["Captation"].append(it)
-            elif "cadreur" in li or "réalisateur" in li or "realisateur" in li or "ingénieur" in li or "ingenieur" in li or "son" in li:
+            elif any(k in li for k in ["cadreur", "réalisateur", "realisateur", "ingénieur", "ingenieur", "son"]):
                 posts["Équipe"].append(it)
             else:
                 posts["Périmètre"].append(it)
@@ -557,7 +719,12 @@ def parse_tech_offer(text: str, filename: str) -> TechOffer:
             out.append(it)
         posts[p] = out
 
-    return TechOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment="")
+    debug = {
+        "vendor": vendor,
+        "total_ttc": total_ttc,
+        "sections": [(t, len(b)) for t, b in sections[:30]],
+    }
+    return TechOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment=""), debug
 
 
 # =========================
@@ -816,6 +983,8 @@ st.markdown(f"## {APP_TITLE}")
 st.caption("Pré-rempli automatique (traiteur + technique) → tu corriges si besoin → export Word.")
 st.divider()
 
+debug_mode = st.checkbox("Mode debug (voir ce que l’extraction comprend)", value=False)
+
 ttc_min = st.number_input("Seuil TTC minimum (alerte) — pas bloquant", min_value=0, max_value=100000, value=500, step=50)
 
 c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="center")
@@ -842,14 +1011,23 @@ tech_files = (tech_files or [])[:2]
 with st.spinner("Lecture des PDFs…"):
     catering_offers: List[CateringOffer] = []
     tech_offers: List[TechOffer] = []
+    debug_dump = {"catering": [], "tech": []}
 
     for f in catering_files:
         txt = extract_pdf_text(f)
-        catering_offers.append(parse_catering_offer(txt, f.name))
+        offer, dbg = parse_catering_offer(txt, f.name)
+        catering_offers.append(offer)
+        debug_dump["catering"].append({"file": f.name, **dbg})
 
     for f in tech_files:
         txt = extract_pdf_text(f)
-        tech_offers.append(parse_tech_offer(txt, f.name))
+        offer, dbg = parse_tech_offer(txt, f.name)
+        tech_offers.append(offer)
+        debug_dump["tech"].append({"file": f.name, **dbg})
+
+if debug_mode:
+    st.subheader("DEBUG — Vendor / TTC / Sections détectées")
+    st.json(debug_dump)
 
 tab1, tab2 = st.tabs(["Traiteur", "Technique"])
 
@@ -861,7 +1039,7 @@ with tab1:
             with st.expander(f"Traiteur {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"c_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire probablement faux (titre interne / poste / contact). Corrige-le.")
+                    st.warning("Nom prestataire probablement faux (déroulé / titre interne / contact / adresse). Corrige-le.")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"c_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)
@@ -888,7 +1066,7 @@ with tab2:
             with st.expander(f"Technique {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"t_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire à vérifier.")
+                    st.warning("Nom prestataire à vérifier (déroulé / titre / contact / adresse).")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"t_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)

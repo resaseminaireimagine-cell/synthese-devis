@@ -1,18 +1,10 @@
-# app.py — Synthèse devis prestataires (VERSION FINALE ROBUSTE)
-# ------------------------------------------------------------
-# Robuste sur:
-# - Devis tabulaires (désignation/qté/PU/HT/TVA/TTC)
-# - PDFs "marketing" + déroulé
-# - CGV longues / IBAN / adresses / références -> filtrées
-#
-# Points forts:
-# 1) Vendor: anti-RCS/TVA/numéros + ancrage SIRET/RCS + fallback sérieux
-# 2) Total TTC: multi-occurrences -> prend la dernière pertinente
-# 3) Hard-stop CGV: coupe tout ce qui suit "conditions générales / cgv"
-# 4) Items: bullets + extraction "libellé gauche" depuis lignes tabulaires
-# 5) Placeholders ": ... : Pax" filtrés
-# 6) Routage item->poste (traiteur et technique) = clé pour devis tabulaires
-# ------------------------------------------------------------
+# app.py — Synthèse devis prestataires (FINAL + édition détail + Word mieux séparé)
+# ------------------------------------------------------------------------------
+# Ajouts clés:
+# - UI: édition du DÉTAIL DES OFFRES (par prestataire, par poste)
+# - Word: séparations nettes (Traiteur vs Technique) + bandeaux prestataires + tables poste/items
+# - Vendor: anti-adresse / anti "EN EUROS" / anti identifiants
+# ------------------------------------------------------------------------------
 
 import io
 import re
@@ -61,7 +53,6 @@ TECH_POSTS = [
     "Conseil",
 ]
 
-
 # =========================
 # LEXICON
 # =========================
@@ -86,30 +77,28 @@ TECH_KEEP_HINTS = [
     "micro", "hf", "console", "mélangeur", "melangeur", "obs", "vmix",
 ]
 
-# Vendor forbidden tokens (avoid choosing section titles)
 VENDOR_FORBIDDEN = [
     "accueil", "pause", "déjeuner", "dejeuner", "buffet", "cocktail", "boissons", "options",
     "personnel", "service", "scénographie", "scenographie",
     "récapitulatif", "recapitulatif", "sur la base", "hors options", "budget", "déroulé", "deroule",
     "détail", "detail", "proposition", "prestation", "inclus", "option",
+    "en euros", "devis", "facture", "total",
 ]
 
-# anti “vendor fantôme” (déroulé / planning)
 VENDOR_HARD_FORBIDDEN = [
     "déroulé", "deroule", "rangement", "départ", "depart", "fin de la prestation",
     "reprise", "arrivée", "arrivee", "livraison", "horaire", "planning",
     "installation", "désinstallation", "desinstallation",
     "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
-    "accueil café", "accueil cafe", "pause café", "pause cafe", "cocktail", "déjeuner", "dejeuner",
 ]
 
 ADDRESS_HINTS = [
     "rue", "avenue", "boulevard", "allée", "allee", "bp", "cedex",
     "france", "paris", "lyon", "marseille", "clichy", "nanterre", "saint",
+    "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
 ]
 
 NOISE_HINTS = [
-    # legal/admin/payment
     "conditions générales", "conditions generales", "cgv", "rgpd", "données personnelles", "donnees personnelles",
     "propriété intellectuelle", "propriete intellectuelle", "droit à l'image", "droit a l'image",
     "iban", "bic", "rib", "banque", "capital", "tva intracommunautaire",
@@ -120,10 +109,8 @@ NOISE_HINTS = [
     "référence", "reference", "devis n", "date de devis", "date de validité", "signature",
     "mode de paiement", "facture",
     "net a payer", "net à payer",
-    # tables/totals
     "désignation", "designation", "quantité", "quantite", "p.u", "pu ht", "montant", "remise", "taux", "qté", "qte", "réf", "ref",
     "base ht", "total ht", "total tva", "tva :", "tva", "page ",
-    # client/vendeur CGV noise
     "le client", "le vendeur", "le preneur",
     "annulation de la commande", "augmentation du nombre", "diminution du nombre",
     "sans que", "dans les délais", "dans les delais",
@@ -188,7 +175,7 @@ def looks_like_schedule_line(s: str) -> bool:
 
 def looks_like_placeholder_line(s: str) -> bool:
     ss = norm(s)
-    if re.match(r"^\s*:\s*[A-Za-zÀ-ÖØ-öø-ÿ].{0,100}:\s*", ss):
+    if re.match(r"^\s*:\s*[A-Za-zÀ-ÖØ-öø-ÿ].{0,120}:\s*", ss):
         return True
     if ss.strip().startswith(":") and re.search(r"\b(pax|nb pax|nombre de pax)\b", fold(ss)):
         return True
@@ -214,27 +201,16 @@ def is_noise_line(s: str) -> bool:
 
     if looks_like_placeholder_line(s):
         return True
-
-    # numéros seuls
     if re.fullmatch(r"\d{1,5}", s):
         return True
-
-    # planning / horaires
     if looks_like_schedule_line(s):
         return True
-
-    # boilerplate juridique/admin
     if any(k in l for k in NOISE_HINTS):
         return True
-
-    # marketing / mentions Institut Imagine très contextuelles
     if "institut imagine" in l and ("étage" in l or "etage" in l or "sur la base" in l):
         return True
-
-    # time-only
     if re.fullmatch(r"(de\s+)?\d{1,2}h(\d{2})?", l):
         return True
-
     return False
 
 
@@ -287,67 +263,6 @@ def find_total_ttc(text: str) -> Optional[float]:
 
 
 # =========================
-# SECTION / HEADER LOGIC (strict, but optional)
-# =========================
-def looks_like_header_line(s: str) -> bool:
-    s = norm(s)
-    if not s or len(s) > 90:
-        return False
-    if s.endswith(".") or s.startswith(("•", "-", "–")):
-        return False
-    alpha = sum(ch.isalpha() for ch in s)
-    if alpha < 4:
-        return False
-    upper_ratio = sum(ch.isupper() for ch in s if ch.isalpha()) / max(1, alpha)
-    has_colon = s.endswith(":") or bool(re.search(r"\s:\s?$", s))
-    numbered = bool(re.match(r"^\s*(\d+[\.\)]|[A-Z][\.\)])\s+", s))
-    is_short = len(s) <= 45
-    return (has_colon and is_short) or (upper_ratio >= 0.70 and alpha >= 6) or (numbered and len(s) <= 70)
-
-
-def is_section_header(line: str) -> bool:
-    l = fold(line)
-    keys = [
-        # catering
-        "accueil", "petit-déjeuner", "petit déjeuner",
-        "pause", "déjeuner", "dejeuner", "buffet",
-        "cocktail", "apéritif", "aperitif", "déjeunatoire", "dejeunatoire",
-        "boissons", "rafraîchissements", "rafraichissements",
-        "livraison", "service", "personnel", "location", "vaisselle", "nappage", "scénographie", "scenographie",
-        # tech
-        "captation", "diffusion", "live", "zoom", "replay", "régie", "regie",
-        "installation", "ingénieur", "ingenieur", "cadreur", "réalisateur", "realisateur",
-        "inclus", "option", "conseil", "prestation",
-    ]
-    return any(k in l for k in keys)
-
-
-def extract_sections(lines: List[str]) -> List[Tuple[str, List[str]]]:
-    sections: List[Tuple[str, List[str]]] = []
-    current_title = "Général"
-    current: List[str] = []
-
-    for ln in lines:
-        if is_section_header(ln) and looks_like_header_line(ln):
-            if current:
-                sections.append((current_title, current))
-            current_title = ln.rstrip(":").strip()
-            current = []
-            continue
-        current.append(ln)
-
-    if current:
-        sections.append((current_title, current))
-
-    cleaned: List[Tuple[str, List[str]]] = []
-    for title, body in sections:
-        body2 = [x for x in body if not is_noise_line(x)]
-        if body2:
-            cleaned.append((title, body2))
-    return cleaned
-
-
-# =========================
 # TABULAR LABEL EXTRACTION
 # =========================
 def extract_left_label_from_tabular(line: str) -> Optional[str]:
@@ -383,18 +298,14 @@ def looks_like_menu_item_line(s: str) -> bool:
     l = fold(s)
     if len(s) < 4 or len(s) > 200:
         return False
-
     if looks_like_price_table_line(s):
         return bool(extract_left_label_from_tabular(s))
-
     if any(k in l for k in ["total", "tva", "iban", "siret", "cgv", "référence", "reference"]):
         return False
-
     if re.search(r"\b(g|gr|kg|ml|cl|l)\b", l):
         return True
     if re.search(r"\b(filet|tarte|salade|quiche|risotto|fromage|dessert|mignard|verrine|canapé|canape|wrap|sandwich)\b", l):
         return True
-
     words = [w for w in re.split(r"\s+", s) if w]
     if 2 <= len(words) <= 12 and sum(w[:1].isupper() for w in words if w[:1].isalpha()) >= 2:
         return True
@@ -408,14 +319,12 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
         if not s or is_noise_line(s):
             continue
 
-        # bullets
         if s.startswith(("•", "-", "–")):
             it = s.lstrip("•-– ").strip()
             if it and not is_noise_line(it):
                 items.append(unglue(it))
             continue
 
-        # tabular: keep left label
         if looks_like_price_table_line(s):
             lab = extract_left_label_from_tabular(s)
             if lab:
@@ -431,7 +340,6 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
                 items.append(unglue(s))
                 continue
 
-    # de-dup
     out, seen = [], set()
     for it in items:
         k = fold(it)
@@ -443,18 +351,13 @@ def extract_items(lines: List[str], keep_hints: List[str], max_len: int, relax: 
 
 
 # =========================
-# VENDOR
+# VENDOR (amélioré)
 # =========================
-def looks_like_section_title(s: str) -> bool:
-    l = fold(s)
-    return any(k in l for k in VENDOR_FORBIDDEN)
-
-
 def vendor_is_suspicious(v: str) -> bool:
     v = norm(v)
     lv = fold(v)
 
-    # Jamais un prestataire: identifiants admin / numéros
+    # identifiants admin
     if re.search(r"\b(r\.?c\.?s\.?|siret|tva|tva intracommunautaire)\b", lv):
         return True
     compact = re.sub(r"\s+", "", v)
@@ -463,23 +366,19 @@ def vendor_is_suspicious(v: str) -> bool:
     if re.fullmatch(r"\d{8,18}", compact):
         return True
 
-    # anti déroulé / planning
     if any(k in lv for k in VENDOR_HARD_FORBIDDEN):
         return True
+    if any(k in lv for k in VENDOR_FORBIDDEN):
+        return True
 
+    # adresse probable: trop de signaux
+    if sum(k in lv for k in ["rue", "avenue", "boulevard", "cedex", "france", "paris"]) >= 2:
+        return True
+
+    # commence par ":"
     if v.strip().startswith(":"):
         return True
     if "@" in v or "contact" in lv:
-        return True
-    if looks_like_section_title(v):
-        return True
-
-    # adresse probable
-    if sum(k in lv for k in ADDRESS_HINTS) >= 2:
-        return True
-
-    # mots parasites
-    if lv in {"appliqué", "applique", "total", "devis"}:
         return True
 
     # trop court
@@ -491,28 +390,25 @@ def vendor_is_suspicious(v: str) -> bool:
 
 def guess_vendor_name(text: str, filename: str) -> str:
     lines = [norm(x) for x in text.splitlines() if norm(x)]
-    top = lines[:220]
+    top = lines[:240]
 
-    # 1) Ancrage fort: ligne au-dessus de SIRET/RCS/TVA intracom
+    # 1) ancrage: au-dessus de SIRET/RCS/TVA intracom
     for idx, ln in enumerate(top):
         l = fold(ln)
         if "siret" in l or "r.c.s" in l or "rcs" in l or "tva intracommunautaire" in l:
-            for back in range(1, 11):
+            for back in range(1, 13):
                 j = idx - back
                 if j >= 0:
                     cand = top[j].strip()
-                    if not cand:
+                    if not cand or is_noise_line(cand) or vendor_is_suspicious(cand):
                         continue
-                    if is_noise_line(cand) or vendor_is_suspicious(cand):
-                        continue
-                    # garde si "raison sociale-ish"
+                    # signal entreprise
                     if re.search(r"\b(sas|sarl|sa|groupe|concept|production|traiteur)\b", fold(cand)) or sum(ch.isalpha() for ch in cand) >= 8:
                         return cand
             break
 
-    # 2) fallback: candidates caps-ish / alpha dans le haut du doc
-    bad = re.compile(r"\b(devis|facture|date|total|tva|iban|bic|net a payer|net à payer|contact)\b", re.I)
-
+    # 2) fallback: meilleure ligne "raison sociale-ish"
+    bad = re.compile(r"\b(devis|facture|date|total|tva|iban|bic|net a payer|net à payer)\b", re.I)
     candidates = []
     for ln in top:
         if len(ln) < 4 or len(ln) > 70:
@@ -539,32 +435,32 @@ def guess_vendor_name(text: str, filename: str) -> str:
             for k in prefer:
                 if k in fc:
                     score += 6
-            if any(k in fc for k in ADDRESS_HINTS):
-                score -= 6
-            if looks_like_header_line(c) and not re.search(r"\b(sas|sarl|sa|groupe|concept|unik|traiteur)\b", fc):
+            if sum(k in fc for k in ["rue", "avenue", "boulevard", "cedex"]) >= 1:
                 score -= 6
             if score > best_score:
                 best_score, best = score, c
         if best and not vendor_is_suspicious(best):
             return best
 
-    return filename.rsplit(".", 1)[0]
+    # 3) filename fallback nettoyé
+    base = filename.rsplit(".", 1)[0]
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
 
 
 # =========================
-# ROUTING (ITEM -> POST)  <-- LA CLÉ
+# ROUTING
 # =========================
 def route_catering_item(item: str) -> str:
     l = fold(item)
 
-    # horaires
     if re.search(r"\b(14h|15h|16h|17h|18h)\b", l):
-        # souvent pause / cocktail ; on laisse scoring préciser ensuite
         if "cocktail" in l:
             return "Cocktail"
         if "pause" in l or "gourmand" in l:
             return "Pause après-midi"
         return "Pause après-midi"
+
     if re.search(r"\b(8h|9h|10h|11h|12h)\b", l):
         if "déjeuner" in l or "dejeuner" in l or "buffet" in l:
             return "Déjeuner"
@@ -574,33 +470,23 @@ def route_catering_item(item: str) -> str:
 
     if any(k in l for k in ["accueil café", "accueil cafe", "café", "cafe", "thé", "the", "thermos", "jus", "lait", "sucre", "tasse", "gobelet"]):
         return "Accueil café"
-
     if any(k in l for k in ["pause", "viennoiser", "gourmand", "mignard", "financier", "cannel", "cookie"]):
-        # sans horaire, défaut matin
         return "Pause matin"
-
     if any(k in l for k in ["déjeuner", "dejeuner", "buffet", "sandwich", "wrap", "salade", "plat", "entrée", "entree", "dessert"]):
         return "Déjeuner"
-
     if any(k in l for k in ["cocktail", "apéritif", "aperitif", "pièce", "pieces", "canapé", "canape", "verrine", "mini"]):
         return "Cocktail"
-
     if any(k in l for k in ["vin", "champagne", "bière", "biere", "soft", "jus", "eau"]):
         return "Boissons (global)"
-
     if any(k in l for k in ["option", "en option", "supplément", "supplement"]):
         return "Options"
-
-    # logistique
     if any(k in l for k in ["livraison", "mise en place", "service", "personnel", "vaisselle", "nappage", "location", "frais"]):
         return "Autres (logistique)"
-
     return "Autres (logistique)"
 
 
 def route_tech_item(item: str) -> str:
     l = fold(item)
-
     if any(k in l for k in ["réalisateur", "realisateur", "cadreur", "ingénieur", "ingenieur", "son", "technicien"]):
         return "Équipe"
     if any(k in l for k in ["caméra", "camera", "4k", "objectif", "pied", "captation"]):
@@ -615,7 +501,6 @@ def route_tech_item(item: str) -> str:
         return "Inclus"
     if any(k in l for k in ["option", "supplément", "supplement", "contrainte"]):
         return "Contraintes / options"
-
     return "Périmètre"
 
 
@@ -644,23 +529,14 @@ def parse_catering_offer(text: str, filename: str) -> Tuple[CateringOffer, Dict]
 
     lines = cut_at_cgv(split_lines(text))
     filtered = [ln for ln in lines if not is_noise_line(ln)]
-    sections = extract_sections(filtered)  # utile si le doc est structuré
+    # collecte globale (plus fiable que sections dans tes devis)
+    collected = extract_items(filtered, MENU_KEEP_HINTS, max_len=260, relax=True)
 
-    # 1) collecte d'items (sections + fallback global)
-    collected: List[str] = []
-    for title, body in sections:
-        # relax dans toutes sections catering probables
-        collected.extend(extract_items(body, MENU_KEEP_HINTS, max_len=260, relax=True))
-
-    if len(collected) < 8:
-        collected = extract_items(filtered, MENU_KEEP_HINTS, max_len=260, relax=True)
-
-    # 2) routage item->poste (le vrai gain)
     posts: Dict[str, List[str]] = {p: [] for p in CATERING_POSTS}
     for it in collected:
         posts[route_catering_item(it)].append(it)
 
-    # 3) dedup
+    # dedup
     for p in posts:
         out, seen = [], set()
         for it in posts[p]:
@@ -671,14 +547,7 @@ def parse_catering_offer(text: str, filename: str) -> Tuple[CateringOffer, Dict]
             out.append(it)
         posts[p] = out
 
-    debug = {
-        "vendor": vendor,
-        "total_ttc": total_ttc,
-        "n_lines": len(lines),
-        "n_filtered": len(filtered),
-        "sections": [(t, len(b)) for t, b in sections[:25]],
-        "n_items": len(collected),
-    }
+    debug = {"vendor": vendor, "total_ttc": total_ttc, "n_items": len(collected)}
     return CateringOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment=""), debug
 
 
@@ -688,14 +557,7 @@ def parse_tech_offer(text: str, filename: str) -> Tuple[TechOffer, Dict]:
 
     lines = cut_at_cgv(split_lines(text))
     filtered = [ln for ln in lines if not is_noise_line(ln)]
-    sections = extract_sections(filtered)
-
-    collected: List[str] = []
-    for title, body in sections:
-        collected.extend(extract_items(body, TECH_KEEP_HINTS, max_len=360, relax=False))
-
-    if len(collected) < 6:
-        collected = extract_items(filtered, TECH_KEEP_HINTS, max_len=360, relax=False)
+    collected = extract_items(filtered, TECH_KEEP_HINTS, max_len=360, relax=False)
 
     posts: Dict[str, List[str]] = {p: [] for p in TECH_POSTS}
     for it in collected:
@@ -712,19 +574,12 @@ def parse_tech_offer(text: str, filename: str) -> Tuple[TechOffer, Dict]:
             out.append(it)
         posts[p] = out
 
-    debug = {
-        "vendor": vendor,
-        "total_ttc": total_ttc,
-        "n_lines": len(lines),
-        "n_filtered": len(filtered),
-        "sections": [(t, len(b)) for t, b in sections[:25]],
-        "n_items": len(collected),
-    }
+    debug = {"vendor": vendor, "total_ttc": total_ttc, "n_items": len(collected)}
     return TechOffer(vendor=vendor, total_ttc=total_ttc, posts=posts, comment=""), debug
 
 
 # =========================
-# WORD
+# WORD HELPERS
 # =========================
 def set_cell_shading(cell, fill_hex: str):
     fill_hex = fill_hex.replace("#", "")
@@ -776,6 +631,22 @@ def add_small(doc: Document, text: str):
     set_run(r, bold=False, size=9, color="#374151")
 
 
+def add_band(doc: Document, label: str, sub: str = ""):
+    # bandeau pleine largeur via tableau 1x1
+    t = doc.add_table(rows=1, cols=1)
+    cell = t.rows[0].cells[0]
+    set_cell_shading(cell, PRIMARY)
+    set_cell_margins(cell, top=120, bottom=120, start=140, end=140)
+    p = cell.paragraphs[0]
+    r = p.add_run(label)
+    set_run(r, bold=True, size=11, color="#FFFFFF")
+    if sub:
+        p2 = cell.add_paragraph()
+        r2 = p2.add_run(sub)
+        set_run(r2, bold=False, size=9, color="#FFFFFF")
+    doc.add_paragraph("")
+
+
 def summarize_for_table(items: List[str], max_chars: int) -> str:
     if not items:
         return ""
@@ -784,6 +655,38 @@ def summarize_for_table(items: List[str], max_chars: int) -> str:
     if len(s) <= max_chars:
         return s
     return s[: max_chars - 5].rstrip() + " (...)"
+
+
+def add_offer_detail_block(doc: Document, title: str, total: str, posts: Dict[str, List[str]], order: List[str]):
+    add_band(doc, title, f"Total TTC : {total}")
+    # table poste -> items
+    t = doc.add_table(rows=1, cols=2)
+    h = t.rows[0].cells
+    h[0].text = "Poste"
+    h[1].text = "Détail"
+    set_cell_shading(h[0], PRIMARY)
+    set_cell_shading(h[1], PRIMARY)
+    for cell in h:
+        for rr in cell.paragraphs[0].runs:
+            set_run(rr, bold=True, size=10, color="#FFFFFF")
+        set_cell_margins(cell)
+
+    for post in order:
+        rr = t.add_row().cells
+        rr[0].text = post
+        set_cell_shading(rr[0], "F3F4F6")
+        for run in rr[0].paragraphs[0].runs:
+            set_run(run, bold=True, size=9, color="#111827")
+        set_cell_margins(rr[0])
+
+        items = posts.get(post, [])
+        rr[1].text = "—" if not items else "\n".join(f"• {x}" for x in items)
+        for p in rr[1].paragraphs:
+            for run in p.runs:
+                set_run(run, bold=False, size=9, color="#111827")
+        set_cell_margins(rr[1])
+
+    doc.add_paragraph("")
 
 
 def build_word(event_title: str, event_date: str, guests: int,
@@ -800,6 +703,7 @@ def build_word(event_title: str, event_date: str, guests: int,
     add_small(doc, f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     doc.add_paragraph("")
 
+    # -------- Synthèse Traiteur --------
     if catering:
         add_subtitle(doc, "1) PRESTATION TRAITEUR — Comparatif (synthèse)")
         vendors = catering[:3]
@@ -844,12 +748,11 @@ def build_word(event_title: str, event_date: str, guests: int,
                 if label == "Total TTC":
                     val = euro_fmt(off.total_ttc)
                 elif label == "Commentaire":
-                    val = norm(off.comment)
-                    val = val[:maxc] + (" (...)" if len(val) > maxc else "")
+                    val = norm(off.comment) or "—"
                 else:
-                    val = summarize_for_table(off.posts.get(label, []), maxc)
+                    val = summarize_for_table(off.posts.get(label, []), maxc) or "—"
 
-                r[j].text = val if val else "—"
+                r[j].text = val
                 for p in r[j].paragraphs:
                     for rr in p.runs:
                         set_run(rr, bold=False, size=9, color="#111827")
@@ -857,6 +760,7 @@ def build_word(event_title: str, event_date: str, guests: int,
 
         doc.add_paragraph("")
 
+    # -------- Synthèse Technique --------
     if tech:
         add_subtitle(doc, "2) PRESTATION TECHNIQUE — Synthèse")
         for idx, off in enumerate(tech[:2], start=1):
@@ -875,74 +779,61 @@ def build_word(event_title: str, event_date: str, guests: int,
                     set_run(rrr, bold=True, size=10, color="#FFFFFF")
                 set_cell_margins(cell)
 
-            for item in ["Périmètre", "Équipe", "Captation", "Régie", "Diffusion", "Replay", "Inclus", "Contraintes / options", "Conseil"]:
+            for item in TECH_POSTS:
                 rrrow = t.add_row().cells
                 rrrow[0].text = item
-                val = norm(off.comment) if item == "Conseil" else summarize_for_table(off.posts.get(item, []), 520)
-                rrrow[1].text = val if val else "—"
                 set_cell_shading(rrrow[0], "F3F4F6")
                 for rrr in rrrow[0].paragraphs[0].runs:
                     set_run(rrr, bold=True, size=9, color="#111827")
-                for cell in rrrow:
-                    set_cell_margins(cell)
-                    for p in cell.paragraphs:
-                        for rrr in p.runs:
-                            set_run(rrr, bold=False, size=9, color="#111827")
+                set_cell_margins(rrrow[0])
+
+                val = norm(off.comment) if item == "Conseil" else "\n".join(off.posts.get(item, []))
+                rrrow[1].text = val if val else "—"
+                set_cell_margins(rrrow[1])
+                for p in rrrow[1].paragraphs:
+                    for rrr in p.runs:
+                        set_run(rrr, bold=False, size=9, color="#111827")
+
             doc.add_paragraph("")
 
+    # =========================
+    # DÉTAILS (séparations + édition)
+    # =========================
     doc.add_page_break()
-    add_title(doc, "DÉTAIL DES OFFRES (éléments)")
-    add_small(doc, "Listes issues de l’extraction automatique, ajustables dans l’outil.")
+    add_title(doc, "DÉTAIL DES OFFRES (modifiable via l’outil)")
+    add_small(doc, "Contenu issu de l’extraction + corrections manuelles réalisées dans l’interface.")
 
+    # -- Détail traiteur sur sa propre page --
     if catering:
+        doc.add_page_break()
+        add_title(doc, "DÉTAIL — PRESTATIONS TRAITEUR")
+        add_small(doc, "Séparation par prestataire.")
         doc.add_paragraph("")
-        add_subtitle(doc, "A) TRAITEUR — Détail par prestataire")
-        for off in catering[:3]:
-            doc.add_paragraph("")
-            add_subtitle(doc, f"{off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
-            for post in CATERING_POSTS:
-                items = off.posts.get(post, [])
-                p = doc.add_paragraph()
-                r = p.add_run(f"{post} :")
-                set_run(r, bold=True, size=10, color="#111827")
-                if not items:
-                    doc.add_paragraph("—")
-                else:
-                    for it in items:
-                        para = doc.add_paragraph(it)
-                        para.style = doc.styles["List Bullet"]
-                        for rr in para.runs:
-                            set_run(rr, bold=False, size=9, color="#111827")
-            if norm(off.comment):
-                p = doc.add_paragraph()
-                r = p.add_run("Commentaire : ")
-                set_run(r, bold=True, size=10, color="#111827")
-                doc.add_paragraph(off.comment)
 
+        for off in catering[:3]:
+            add_offer_detail_block(
+                doc,
+                title=off.vendor,
+                total=euro_fmt(off.total_ttc),
+                posts=off.posts,
+                order=CATERING_POSTS,
+            )
+
+    # -- Détail technique sur sa propre page --
     if tech:
+        doc.add_page_break()
+        add_title(doc, "DÉTAIL — PRESTATIONS TECHNIQUES")
+        add_small(doc, "Séparation par prestataire.")
         doc.add_paragraph("")
-        add_subtitle(doc, "B) TECHNIQUE — Détail par prestataire")
+
         for off in tech[:2]:
-            doc.add_paragraph("")
-            add_subtitle(doc, f"{off.vendor} — Total TTC : {euro_fmt(off.total_ttc)}")
-            for post in TECH_POSTS:
-                items = off.posts.get(post, [])
-                p = doc.add_paragraph()
-                r = p.add_run(f"{post} :")
-                set_run(r, bold=True, size=10, color="#111827")
-                if not items:
-                    doc.add_paragraph("—")
-                else:
-                    for it in items:
-                        para = doc.add_paragraph(it)
-                        para.style = doc.styles["List Bullet"]
-                        for rr in para.runs:
-                            set_run(rr, bold=False, size=9, color="#111827")
-            if norm(off.comment):
-                p = doc.add_paragraph()
-                r = p.add_run("Conseil (synthèse) : ")
-                set_run(r, bold=True, size=10, color="#111827")
-                doc.add_paragraph(off.comment)
+            add_offer_detail_block(
+                doc,
+                title=off.vendor,
+                total=euro_fmt(off.total_ttc),
+                posts=off.posts,
+                order=TECH_POSTS,
+            )
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -950,7 +841,7 @@ def build_word(event_title: str, event_date: str, guests: int,
 
 
 # =========================
-# STREAMLIT
+# STREAMLIT UI
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -976,12 +867,12 @@ header[data-testid="stHeader"] {{ display: none; }}
 )
 
 st.markdown(f"## {APP_TITLE}")
-st.caption("Pré-rempli automatique (traiteur + technique) → tu corriges si besoin → export Word.")
+st.caption("Pré-rempli automatique (traiteur + technique) → tu corriges (y compris les détails) → export Word.")
 st.divider()
 
-debug_mode = st.checkbox("Mode debug (voir ce que l’extraction comprend)", value=False)
+debug_mode = st.checkbox("Mode debug (voir vendor/ttc/items)", value=False)
 
-ttc_min = st.number_input("Seuil TTC minimum (alerte) — pas bloquant", min_value=0, max_value=100000, value=500, step=50)
+ttc_min = st.number_input("Seuil TTC minimum (alerte) — pas bloquant", min_value=0, max_value=200000, value=500, step=50)
 
 c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="center")
 with c1:
@@ -1022,11 +913,12 @@ with st.spinner("Lecture des PDFs…"):
         debug_dump["tech"].append({"file": f.name, **dbg})
 
 if debug_mode:
-    st.subheader("DEBUG — Vendor / TTC / volumes")
+    st.subheader("DEBUG")
     st.json(debug_dump)
 
-tab1, tab2 = st.tabs(["Traiteur", "Technique"])
+tab1, tab2, tab3 = st.tabs(["Synthèse (édition)", "Détail (édition)", "Technique (édition)"])
 
+# -------- Synthèse traiteur (édition) --------
 with tab1:
     if not catering_offers:
         st.caption("Aucun devis traiteur.")
@@ -1035,7 +927,7 @@ with tab1:
             with st.expander(f"Traiteur {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"c_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire probablement faux (RCS/TVA/numéro/déroulé/adresse). Corrige-le.")
+                    st.warning("Nom prestataire probablement faux (adresse / en-tête / RCS/TVA). Corrige-le.")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"c_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)
@@ -1045,16 +937,34 @@ with tab1:
                 colL, colR = st.columns(2)
                 with colL:
                     for post in ["Accueil café", "Pause matin", "Déjeuner", "Pause après-midi"]:
-                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=150, key=f"c_{i}_{post}")
+                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=150, key=f"c_sum_{i}_{post}")
                         off.posts[post] = [norm(x) for x in edited.splitlines() if norm(x)]
                 with colR:
                     for post in ["Cocktail", "Boissons (global)", "Options", "Autres (logistique)"]:
-                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=150, key=f"c_{i}_{post}")
+                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=150, key=f"c_sum_{i}_{post}")
                         off.posts[post] = [norm(x) for x in edited.splitlines() if norm(x)]
 
                 off.comment = st.text_area("Commentaire", value=off.comment, height=80, key=f"c_comment_{i}")
 
+# -------- Détail traiteur (édition dédiée) --------
 with tab2:
+    if not catering_offers:
+        st.caption("Aucun devis traiteur.")
+    else:
+        st.info("Ici tu modifies ce qui alimentera la section “DÉTAIL DES OFFRES” du Word.")
+        for i, off in enumerate(catering_offers, start=1):
+            with st.expander(f"Détail — Traiteur {i} : {off.vendor}", expanded=False):
+                for post in CATERING_POSTS:
+                    edited = st.text_area(
+                        f"{post} (détail)",
+                        value="\n".join(off.posts.get(post, [])),
+                        height=160,
+                        key=f"c_det_{i}_{post}",
+                    )
+                    off.posts[post] = [norm(x) for x in edited.splitlines() if norm(x)]
+
+# -------- Technique (édition) --------
+with tab3:
     if not tech_offers:
         st.caption("Aucun devis technique.")
     else:
@@ -1062,7 +972,7 @@ with tab2:
             with st.expander(f"Technique {i} — {off.vendor}", expanded=(i == 1)):
                 off.vendor = st.text_input("Nom prestataire", value=off.vendor, key=f"t_vendor_{i}")
                 if vendor_is_suspicious(off.vendor):
-                    st.warning("Nom prestataire à vérifier (RCS/TVA/numéro/déroulé/adresse).")
+                    st.warning("Nom prestataire probablement faux (adresse / en-tête / TVA/RCS). Corrige-le.")
 
                 ttc_in = st.text_input("Total TTC", value=("" if off.total_ttc is None else euro_fmt(off.total_ttc)), key=f"t_ttc_{i}")
                 off.total_ttc = parse_eur_amount(ttc_in)
@@ -1072,11 +982,11 @@ with tab2:
                 col1, col2 = st.columns(2)
                 with col1:
                     for post in ["Périmètre", "Équipe", "Captation", "Régie"]:
-                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=120, key=f"t_{i}_{post}")
+                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=130, key=f"t_{i}_{post}")
                         off.posts[post] = [norm(x) for x in edited.splitlines() if norm(x)]
                 with col2:
                     for post in ["Diffusion", "Replay", "Inclus", "Contraintes / options"]:
-                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=120, key=f"t_{i}_{post}")
+                        edited = st.text_area(post, value="\n".join(off.posts.get(post, [])), height=130, key=f"t_{i}_{post}")
                         off.posts[post] = [norm(x) for x in edited.splitlines() if norm(x)]
 
                 off.comment = st.text_area("Conseil", value=off.comment, height=90, key=f"t_comment_{i}")
